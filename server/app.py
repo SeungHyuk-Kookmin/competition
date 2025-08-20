@@ -14,7 +14,6 @@ from sqlalchemy import func, UniqueConstraint
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from sqlalchemy import func, UniqueConstraint, delete
-from __future__ import annotations
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -568,8 +567,7 @@ def finalize(request: Request, body: FinalizeBody):
 
 # 관리자: 유저 목록 조회 (옵션: 팀 필터)
 @app.get("/admin/users")
-def admin_list_users(_: User = Depends(admin_required), team: Optional[str] = None, limit: int = 500):
-    _require_admin(request)
+def admin_list_users(request: Request, _: User = Depends(admin_required), team: Optional[str] = None, limit: int = 500):
     with Session(engine) as s:
         q = select(User)
         if team:
@@ -726,12 +724,9 @@ def final_leaderboard_public(limit: int = 100):
 def final_leaderboard_private(request: Request, limit: int = 100):
     user = _get_current_user(request)
     if not _has_private_access(request, user):
-        raise HTTPException(status_code=403, detail="Forbidden.")  # 메시지 통일
+        raise HTTPException(status_code=403, detail="Forbidden.")
 
-    if GT_ALL is None:
-        raise HTTPException(status_code=500, detail="GT_ALL not available")
-
-    # 모든 팀의 최종 선택을 불러온다
+    # picks 모으기
     with Session(engine) as s:
         picks = s.exec(select(FinalPick)).all()
         if not picks:
@@ -739,44 +734,48 @@ def final_leaderboard_private(request: Request, limit: int = 100):
         team_to_ids = {}
         for p in picks:
             team_to_ids.setdefault(p.team, set()).add(p.submission_id)
-        ids = {pid for v in team_to_ids.values() for pid in v}
 
-        subs = {r.id: r for r in s.exec(select(Submission).where(Submission.id.in_(list(ids)))).all()}
-        files = {r.submission_id: r for r in s.exec(select(SubFile).where(SubFile.submission_id.in_(list(ids)))).all()}
+        ids = {pid for v in team_to_ids.values() for pid in v}
+        subs_list = s.exec(select(Submission).where(Submission.id.in_(list(ids)))).all()
+        files_list = s.exec(select(SubFile).where(SubFile.submission_id.in_(list(ids)))).all()
+
+    subs = {r.id: r for r in subs_list}
+    files = {r.submission_id: r for r in files_list}
+
+    def _score_for_final(sid: int):
+        """GT_ALL 재채점 시도 → 실패 시 private_score 폴백."""
+        sub = subs.get(sid)
+        sf = files.get(sid)
+        # 1) GT_ALL로 재채점
+        if GT_ALL is not None and sf and sf.path and os.path.exists(sf.path):
+            sc, _rows, _w = _score_file_on_gt(sf.path, GT_ALL)
+            if sc is not None:
+                return float(sc), sub
+        # 2) 기존 private_score 폴백
+        if sub and sub.private_score is not None:
+            return float(sub.private_score), sub
+        return None, sub
 
     items = []
     for team, idset in team_to_ids.items():
         best = None
         for sid in idset:
-            sub = subs.get(sid)
-            sf = files.get(sid)
-
-            score = None
-            if sf and os.path.exists(sf.path):
-                sc, _rows, _w = _score_file_on_gt(sf.path, GT_ALL)
-                score = sc
-            # 폴백: 파일이 없으면 기존 private_score 사용(정확 전체 AUC는 아님)
-            if score is None and sub and sub.private_score is not None:
-                score = float(sub.private_score)
+            score, sub = _score_for_final(sid)
             if score is None:
                 continue
-
             cand = {
                 "team": team,
                 "submission_id": sid,
-                # 필드명은 호환을 위해 private_score로 유지하지만 값은 "전체 테스트 AUC"
                 "private_score": round(float(score), 6),
-                "received_at": ts_kst(sub.received_at) if sub else None,
+                "received_at": ts_kst(sub.received_at) if sub and sub.received_at else None,
             }
-
             if (best is None) or (cand["private_score"] > best["private_score"]) or \
-               (cand["private_score"] == best["private_score"] and sub and subs.get(best["submission_id"]) and sub.received_at < subs[best["submission_id"]].received_at):
+               (cand["private_score"] == best["private_score"] and sub and best and subs.get(best["submission_id"]) and sub.received_at < subs[best["submission_id"]].received_at):
                 best = cand
-
         if best:
             items.append(best)
 
-    items = sorted(items, key=lambda r: (-r["private_score"], r["received_at"] or ""))
+    items.sort(key=lambda r: (-r["private_score"], r["received_at"] or ""))
     return items[:limit]
 
 @app.get("/final/leaderboard_public_csv")
@@ -792,12 +791,10 @@ def final_leaderboard_public_csv(limit: int = 100):
 
 @app.get("/final/leaderboard_private_csv")
 def final_leaderboard_private_csv(request: Request, limit: int = 100):
-    user = _get_current_user(request)
-    if not _has_private_access(request, user):
-        raise HTTPException(status_code=403, detail="Forbidden.")
     data = final_leaderboard_private(request, limit=limit)
     if not data:
-        return _csv_response("final_leaderboard_private", pd.DataFrame(columns=["team","submission_id","private_score","received_at"]))
+        return _csv_response("final_leaderboard_private",
+                             pd.DataFrame(columns=["team","submission_id","private_score","received_at"]))
     df = pd.DataFrame(data)
     return _csv_response("final_leaderboard_private", df)
 
