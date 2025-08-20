@@ -238,21 +238,24 @@ def _require_user(request: Request) -> User:
     return user
 
 def _has_private_access(request: Request, user: Optional[User]) -> bool:
-    # ✅ 관리자면 언제나 허용
+    # 1) 관리자 또는 X-ADMIN-KEY는 항상 허용
     if user and getattr(user, "is_admin", False):
         return True
+    key = request.headers.get("X-ADMIN-KEY", "")
+    if ADMIN_KEY and key == ADMIN_KEY:
+        return True
 
+    # 2) 가시성 정책
     if PRIVATE_VISIBILITY == "public":
         return True
+    if PRIVATE_VISIBILITY == "admin":
+        return False
     if PRIVATE_VISIBILITY == "hidden":
         return False
-    if PRIVATE_VISIBILITY == "admin":
-        if user and user.is_admin:
-            return True
-        key = request.headers.get("X-ADMIN-KEY", "")
-        if ADMIN_KEY and key == ADMIN_KEY:
-            return True
-        return False
+    if PRIVATE_VISIBILITY == "public_after":
+        now_kst = datetime.now(timezone.utc).astimezone(KST)
+        return bool(RELEASE_AT_KST and now_kst >= RELEASE_AT_KST)
+
     return False
 
 # ================== 채점 유틸 ==================
@@ -717,8 +720,9 @@ def final_leaderboard_public(limit: int = 100):
 @app.get("/final/leaderboard_private")
 def final_leaderboard_private(request: Request, limit: int = 100):
     user = _get_current_user(request)
-    if not (user and getattr(user, "is_admin", False)):
-        raise HTTPException(status_code=403, detail="Admins only.")
+    if not _has_private_access(request, user):
+        raise HTTPException(status_code=403, detail="Forbidden.")  # 메시지 통일
+
     if GT_ALL is None:
         raise HTTPException(status_code=500, detail="GT_ALL not available")
 
@@ -784,8 +788,8 @@ def final_leaderboard_public_csv(limit: int = 100):
 @app.get("/final/leaderboard_private_csv")
 def final_leaderboard_private_csv(request: Request, limit: int = 100):
     user = _get_current_user(request)
-    if not (user and getattr(user, "is_admin", False)):
-        raise HTTPException(status_code=403, detail="Admins only.")
+    if not _has_private_access(request, user):
+        raise HTTPException(status_code=403, detail="Forbidden.")
     data = final_leaderboard_private(request, limit=limit)
     if not data:
         return _csv_response("final_leaderboard_private", pd.DataFrame(columns=["team","submission_id","private_score","received_at"]))
