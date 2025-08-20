@@ -22,6 +22,8 @@ KST = timezone(timedelta(hours=9))
 PRIVATE_VISIBILITY = os.getenv("PRIVATE_VISIBILITY", "hidden")  # hidden | admin | public | public_after
 PRIVATE_RELEASE_AT = os.getenv("PRIVATE_RELEASE_AT", "2025-08-29-14-00-00").strip()  # 예: "2025-08-21-09-00-00" 또는 "2025-08-21 09:00:00" 또는 "2025-08-21"
 
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
 # ✅ 고정 KST (DST 없음)
 KST = timezone(timedelta(hours=9))
 TZ_NAME = "Asia/Seoul"  # 표기용
