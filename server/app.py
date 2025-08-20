@@ -47,6 +47,34 @@ RELEASE_AT_KST = _parse_release_at_kst(PRIVATE_RELEASE_AT)
 def ts_kst(dt: datetime) -> str:
     return dt.astimezone(KST).strftime("%Y-%m-%d-%H-%M-%S")
 
+def create_access_token(user):
+    payload = {
+        "sub": user.email,
+        "team": user.team,
+        "is_admin": bool(user.is_admin),
+        "exp": datetime.utcnow() + timedelta(hours=12),
+    }
+    token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
+    return token
+
+def get_current_user(token: str = Depends(oauth2_scheme), session: Session = Depends(get_session)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        email = payload.get("sub")
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user = session.exec(select(User).where(User.email == email)).first()
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        return user
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+def admin_required(user: User = Depends(get_current_user)):
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return user
+
 SUBMIT_SAVE_DIR = os.getenv("SUBMIT_SAVE_DIR", "./submissions")
 os.makedirs(SUBMIT_SAVE_DIR, exist_ok=True)
 
@@ -75,6 +103,14 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "720"))  # 12h 기본
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+access_token = create_access_token(user)
+return {
+    "access_token": access_token,
+    "team": user.team,
+    "is_admin": bool(user.is_admin),
+}
+
 # =========================================
 
 app = FastAPI(title="Competition Scoring API")
@@ -708,8 +744,9 @@ def final_leaderboard_public(limit: int = 100):
 @app.get("/final/leaderboard_private")
 def final_leaderboard_private(request: Request, limit: int = 100):
     user = _get_current_user(request)
-    if not _has_private_access(request, user):
-        raise HTTPException(status_code=403, detail="Forbidden.")
+    # ✅ 관리자만 허용 (토큰 → DB에서 읽어온 user.is_admin 기준)
+    if not (user and getattr(user, "is_admin", False)):
+        raise HTTPException(status_code=403, detail="Admins only.")
     if GT_ALL is None:
         raise HTTPException(status_code=500, detail="GT_ALL not available")
 
