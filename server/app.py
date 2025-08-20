@@ -14,6 +14,7 @@ from sqlalchemy import func, UniqueConstraint
 from jose import jwt, JWTError
 from passlib.context import CryptContext
 from sqlalchemy import func, UniqueConstraint, delete
+from __future__ import annotations
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -47,7 +48,7 @@ RELEASE_AT_KST = _parse_release_at_kst(PRIVATE_RELEASE_AT)
 def ts_kst(dt: datetime) -> str:
     return dt.astimezone(KST).strftime("%Y-%m-%d-%H-%M-%S")
 
-def admin_required(request: Request) -> User:
+def admin_required(request: Request):  # ← 반환 타입 힌트 빼기(또는 위의 __future__ 사용)
     u = _get_current_user(request)
     if u and getattr(u, "is_admin", False):
         return u
