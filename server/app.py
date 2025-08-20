@@ -47,16 +47,6 @@ RELEASE_AT_KST = _parse_release_at_kst(PRIVATE_RELEASE_AT)
 def ts_kst(dt: datetime) -> str:
     return dt.astimezone(KST).strftime("%Y-%m-%d-%H-%M-%S")
 
-def create_access_token(user):
-    payload = {
-        "sub": user.email,
-        "team": user.team,
-        "is_admin": bool(user.is_admin),
-        "exp": datetime.utcnow() + timedelta(hours=12),
-    }
-    token = jwt.encode(payload, SECRET_KEY, algorithm="HS256")
-    return token
-
 def get_current_user(token: str = Depends(oauth2_scheme), session: Session = Depends(get_session)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
@@ -100,16 +90,12 @@ ADMIN_KEY = os.getenv("ADMIN_KEY", "")  # (옵션) 관리자 헤더 백도어
 # JWT
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-insecure-secret-change-me")
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "720"))  # 12h 기본
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "720"))
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-access_token = create_access_token(user)
-return {
-    "access_token": access_token,
-    "team": user.team,
-    "is_admin": bool(user.is_admin),
-}
+def create_access_token(data: dict, minutes: int = ACCESS_TOKEN_EXPIRE_MINUTES) -> str:
+    to_encode = data.copy()
+    to_encode.update({"exp": datetime.utcnow() + timedelta(minutes=minutes)})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 # =========================================
 
@@ -238,11 +224,6 @@ def hash_password(pw: str) -> str:
 
 def verify_password(pw: str, pw_hash: str) -> bool:
     return pwd_context.verify(pw, pw_hash)
-
-def create_access_token(data: dict, minutes: int = ACCESS_TOKEN_EXPIRE_MINUTES) -> str:
-    to_encode = data.copy()
-    to_encode.update({"exp": datetime.utcnow() + timedelta(minutes=minutes)})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def get_user_by_email(email: str) -> Optional[User]:
     with Session(engine) as s:
@@ -414,8 +395,8 @@ def login(body: LoginBody):
     user = get_user_by_email(email)
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(status_code=401, detail="invalid credentials")
-    token = create_access_token({"sub": user.email, "team": user.team, "admin": user.is_admin})
-    return {"access_token": token, "token_type": "bearer", "team": user.team, "is_admin": user.is_admin}
+    token = create_access_token({"sub": user.email, "team": user.team, "is_admin": bool(user.is_admin)})
+    return {"access_token": token, "token_type": "bearer", "team": user.team, "is_admin": bool(user.is_admin)}
 
 @app.get("/auth/me")
 def me(request: Request):
@@ -702,7 +683,7 @@ def leaderboard_public_csv(limit: int = 100):
     return _csv_response("leaderboard_public", df)
 
 @app.get("/leaderboard/private_csv")
-def leaderboard_private_csv(request: Request, limit: int = 100):
+def @app.get("/final/leaderboard_private")(request: Request, limit: int = 100):
     user = _get_current_user(request)
     if not _has_private_access(request, user):
         raise HTTPException(status_code=403, detail="Forbidden.")
@@ -744,7 +725,6 @@ def final_leaderboard_public(limit: int = 100):
 @app.get("/final/leaderboard_private")
 def final_leaderboard_private(request: Request, limit: int = 100):
     user = _get_current_user(request)
-    # ✅ 관리자만 허용 (토큰 → DB에서 읽어온 user.is_admin 기준)
     if not (user and getattr(user, "is_admin", False)):
         raise HTTPException(status_code=403, detail="Admins only.")
     if GT_ALL is None:
@@ -812,8 +792,8 @@ def final_leaderboard_public_csv(limit: int = 100):
 @app.get("/final/leaderboard_private_csv")
 def final_leaderboard_private_csv(request: Request, limit: int = 100):
     user = _get_current_user(request)
-    if not _has_private_access(request, user):
-        raise HTTPException(status_code=403, detail="Forbidden.")
+    if not (user and getattr(user, "is_admin", False)):
+        raise HTTPException(status_code=403, detail="Admins only.")
     data = final_leaderboard_private(request, limit=limit)
     if not data:
         return _csv_response("final_leaderboard_private", pd.DataFrame(columns=["team","submission_id","private_score","received_at"]))
