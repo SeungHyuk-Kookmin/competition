@@ -1,32 +1,31 @@
 import os, sys
-from sqlmodel import Session, select, create_engine
+from sqlmodel import SQLModel, create_engine, Session, select
 
+# --- flexible import ---
 try:
-    # 패키지 실행 시
-    from server.app import User, DB_URL, engine
-except Exception:
-    # CWD가 server/일 때
-    sys.path.append(os.path.dirname(__file__))                 # /server
-    sys.path.append(os.path.dirname(os.path.dirname(__file__)))# / (project root)
-    from app import User
-    DB_URL = os.getenv("DATABASE_URL", "sqlite:///./leaderboard.db")
-    engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
+    from server.app import User, hash_password
+except ModuleNotFoundError:
+    try:
+        from app import User, hash_password
+    except ModuleNotFoundError:
+        sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+        from server.app import User, hash_password
 
-def set_admin(email: str, on: bool=True):
-    with Session(engine) as s:
-        u = s.exec(select(User).where(User.email == email.strip().lower())).first()
-        if not u:
-            print(f"❌ user not found: {email}"); sys.exit(1)
-        u.is_admin = bool(on)
+DB_URL = os.environ.get("DATABASE_URL", "sqlite:///./leaderboard.db")
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
+SQLModel.metadata.create_all(engine)
+
+EMAIL = os.environ.get("ADMIN_EMAIL", "chungii2287@gmail.com")
+TEAM  = os.environ.get("ADMIN_TEAM", "Admins")
+PWD   = os.environ.get("ADMIN_PASSWORD", "Tkdhak6708!")
+
+with Session(engine) as s:
+    u = s.exec(select(User).where(User.email == EMAIL)).first()
+    if u:
+        u.is_admin = True
         s.add(u); s.commit()
-        print(f"✅ set is_admin={u.is_admin} for {u.email}")
-
-if __name__ == "__main__":
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--email", required=True)
-    g = p.add_mutually_exclusive_group()
-    g.add_argument("--on", action="store_true")
-    g.add_argument("--off", action="store_true")
-    args = p.parse_args()
-    set_admin(args.email, on=(not args.off))
+        print(f"Promoted to admin: {EMAIL} (team={u.team})")
+    else:
+        u = User(email=EMAIL, team=TEAM, password_hash=hash_password(PWD), is_admin=True)
+        s.add(u); s.commit()
+        print(f"Created admin: {EMAIL} / {PWD} (team={TEAM})")
