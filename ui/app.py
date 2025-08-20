@@ -40,7 +40,7 @@ with st.sidebar:
     if not st.session_state.token:
         tab_login, tab_register = st.tabs(["로그인", "회원가입"])
         with tab_login:
-            email = st.text_input("이메일", key="login_email")
+            email = st.text_input("아이디", key="login_email")
             pw = st.text_input("패스워드", type="password", key="login_pw")
             if st.button("로그인"):
                 try:
@@ -59,7 +59,7 @@ with st.sidebar:
                 except Exception as e:
                     st.error(str(e))
         with tab_register:
-            email_r = st.text_input("이메일", key="reg_email")
+            email_r = st.text_input("아이디", key="reg_email")
             team_r = st.text_input("팀명", key="reg_team")
             pw_r = st.text_input("패스워드", type="password", key="reg_pw")
             if st.button("회원가입"):
@@ -348,11 +348,11 @@ if st.session_state.is_admin:
 
         # 섹션 3: 계정 삭제 (옵션: 같은 팀 제출도 함께 삭제)
         st.markdown("#### 계정 삭제")
-        email_del = st.text_input("이메일", key="admin_delete_email")
+        email_del = st.text_input("아이디", key="admin_delete_email")
         cascade = st.checkbox("같은 팀의 제출도 함께 삭제", value=False, key="admin_cascade")
         if st.button("계정 삭제", key="btn_delete_user"):
             if not email_del.strip():
-                st.warning("이메일을 입력하세요.")
+                st.warning("아이디를 입력하세요.")
             else:
                 rr = requests.delete(
                     f"{API}/admin/user/{email_del.strip()}",
@@ -394,7 +394,7 @@ if st.session_state.is_admin:
                 use_container_width=True,
                 column_config={
                     "삭제": st.column_config.CheckboxColumn("삭제", help="삭제할 계정 선택", default=False),
-                    "email": st.column_config.TextColumn("이메일", disabled=True),
+                    "email": st.column_config.TextColumn("아이디", disabled=True),
                     "team": st.column_config.TextColumn("팀", disabled=True),
                     "is_admin": st.column_config.CheckboxColumn("관리자", disabled=True),
                 },
