@@ -47,16 +47,14 @@ RELEASE_AT_KST = _parse_release_at_kst(PRIVATE_RELEASE_AT)
 def ts_kst(dt: datetime) -> str:
     return dt.astimezone(KST).strftime("%Y-%m-%d-%H-%M-%S")
 
-def get_current_user(request: Request) -> User:
-    user = _get_current_user(request)
-    if not user:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    return user
-
-def admin_required(user: User = Depends(get_current_user)):
-    if not user.is_admin:
-        raise HTTPException(status_code=403, detail="Forbidden")
-    return user
+def admin_required(request: Request) -> User:
+    u = _get_current_user(request)
+    if u and getattr(u, "is_admin", False):
+        return u
+    key = request.headers.get("X-ADMIN-KEY", "")
+    if ADMIN_KEY and key == ADMIN_KEY:
+        return u  # u가 None이어도 키로 통과 허용
+    raise HTTPException(status_code=403, detail="Admins only.")
 
 SUBMIT_SAVE_DIR = os.getenv("SUBMIT_SAVE_DIR", "./submissions")
 os.makedirs(SUBMIT_SAVE_DIR, exist_ok=True)
@@ -569,7 +567,7 @@ def finalize(request: Request, body: FinalizeBody):
 
 # 관리자: 유저 목록 조회 (옵션: 팀 필터)
 @app.get("/admin/users")
-def admin_list_users(request: Request, team: Optional[str] = None, limit: int = 500):
+def admin_list_users(_: User = Depends(admin_required), team: Optional[str] = None, limit: int = 500):
     _require_admin(request)
     with Session(engine) as s:
         q = select(User)
