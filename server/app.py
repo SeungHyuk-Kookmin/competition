@@ -251,6 +251,10 @@ def _require_user(request: Request) -> User:
     return user
 
 def _has_private_access(request: Request, user: Optional[User]) -> bool:
+    # ✅ 관리자면 언제나 허용
+    if user and getattr(user, "is_admin", False):
+        return True
+
     if PRIVATE_VISIBILITY == "public":
         return True
     if PRIVATE_VISIBILITY == "hidden":
@@ -683,13 +687,14 @@ def leaderboard_public_csv(limit: int = 100):
     return _csv_response("leaderboard_public", df)
 
 @app.get("/leaderboard/private_csv")
-def @app.get("/final/leaderboard_private")(request: Request, limit: int = 100):
+def leaderboard_private_csv(request: Request, limit: int = 100):
     user = _get_current_user(request)
     if not _has_private_access(request, user):
         raise HTTPException(status_code=403, detail="Forbidden.")
     items = _best_per_team("private_score")[:limit]
     if not items:
-        return _csv_response("leaderboard_private", pd.DataFrame(columns=["team","private_score","rows_private","received_at"]))
+        return _csv_response("leaderboard_private",
+                             pd.DataFrame(columns=["team","private_score","rows_private","received_at"]))
     df = pd.DataFrame([{"team": r.team,
                         "private_score": round(float(r.private_score), 6) if r.private_score is not None else None,
                         "rows_private": r.rows_private,
