@@ -47,19 +47,6 @@ RELEASE_AT_KST = _parse_release_at_kst(PRIVATE_RELEASE_AT)
 def ts_kst(dt: datetime) -> str:
     return dt.astimezone(KST).strftime("%Y-%m-%d-%H-%M-%S")
 
-def get_current_user(token: str = Depends(oauth2_scheme), session: Session = Depends(get_session)):
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        email = payload.get("sub")
-        if not email:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        user = session.exec(select(User).where(User.email == email)).first()
-        if not user:
-            raise HTTPException(status_code=401, detail="User not found")
-        return user
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
 def admin_required(user: User = Depends(get_current_user)):
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="Forbidden")
