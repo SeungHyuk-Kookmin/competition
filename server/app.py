@@ -394,7 +394,11 @@ def login(body: LoginBody):
     email = body.email.strip().lower()
     user = get_user_by_email(email)
     if not user or not verify_password(body.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="invalid credentials")
+        raise HTTPException(
+    status_code=401,
+    detail={"code": "INVALID_CREDENTIALS", "message": "아이디 또는 비밀번호가 올바르지 않습니다."},
+    headers={"WWW-Authenticate": "Bearer"}  # 토큰 기반이면 권장
+)
     token = create_access_token({"sub": user.email, "team": user.team, "is_admin": bool(user.is_admin)})
     return {"access_token": token, "token_type": "bearer", "team": user.team, "is_admin": bool(user.is_admin)}
 
@@ -424,7 +428,14 @@ async def submit(request: Request, file: UploadFile = File(...)):
         if cnt >= DAILY_LIMIT:
             raise HTTPException(
                 status_code=429,
-                detail=f"Daily submission limit ({DAILY_LIMIT}) reached for team '{team}' (resets at 00:00 {TZ_NAME}).",
+                detail={
+                    "code": "DAILY_LIMIT_EXCEEDED",
+                    "message": f"하루 제출 한도({DAILY_LIMIT})를 초과했습니다.",
+                    "team": team,
+                    "reset_at_local": f"00:00 {TZ_NAME}",
+                },
+                # 필요하면 재시도 힌트도 제공
+                # headers={"Retry-After": str(retry_after_seconds)}
             )
 
         # CSV 읽기
