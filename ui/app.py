@@ -85,7 +85,7 @@ with st.sidebar:
                 except Exception as e:
                     st.error(str(e))
         with tab_register:
-            email_r = st.text_input("아이디(이메일)", key="reg_email")
+            email_r = st.text_input("아이디", key="reg_email")
             team_r = st.text_input("팀명", key="reg_team")
             name_r = st.text_input("이름", key="reg_name")                 # ✅
             sid_r  = st.text_input("학번(숫자 8자리)", key="reg_sid")       # ✅
