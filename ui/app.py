@@ -23,7 +23,21 @@ st.set_page_config(page_title="ML STUDY Competition", layout="wide")
 st.title("📈 D&A X WEAVE 여름방학 ML STUDY Competition")
 st.caption("일일 제출 제한: 팀당 10회 (자정 기준)")
 
-
+def parse_err(resp):
+    try:
+        js = resp.json()
+    except Exception:
+        return resp.text
+    # FastAPI 표준(detail), 커스텀(code/message) 모두 처리
+    if isinstance(js, dict):
+        if "message" in js:
+            return js.get("message")
+        d = js.get("detail")
+        if isinstance(d, dict):
+            return d.get("message") or d.get("detail") or str(d)
+        if isinstance(d, str):
+            return d
+    return str(js)
 
 # -------- Session State --------
 if "token" not in st.session_state:
@@ -35,6 +49,18 @@ def authed_headers():
     return {"Authorization": f"Bearer {st.session_state.token}"} if st.session_state.token else {}
 
 # -------- Sidebar: Auth --------
+
+def fetch_quota():
+    if not st.session_state.token:
+        return None
+    try:
+        r = requests.get(f"{API}/my_quota", headers=authed_headers(), timeout=20)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
 with st.sidebar:
     st.subheader("로그인")
     if not st.session_state.token:
@@ -55,41 +81,52 @@ with st.sidebar:
                         st.success(f"환영합니다, {st.session_state.team} 팀!")
                         st.rerun()
                     else:
-                        st.error(r.text)
+                        st.error(parse_err(r))
                 except Exception as e:
                     st.error(str(e))
         with tab_register:
-            email_r = st.text_input("아이디", key="reg_email")
+            email_r = st.text_input("아이디(이메일)", key="reg_email")
             team_r = st.text_input("팀명", key="reg_team")
+            name_r = st.text_input("이름", key="reg_name")                 # ✅
+            sid_r  = st.text_input("학번(숫자 8자리)", key="reg_sid")       # ✅
             pw_r = st.text_input("패스워드", type="password", key="reg_pw")
             if st.button("회원가입"):
-                try:
-                    r = requests.post(
-                        f"{API}/auth/register",
-                        json={"email": email_r.strip().lower(),
-                            "team": team_r.strip(),
-                            "password": pw_r},
-                        timeout=30
-                    )
-                    if r.status_code == 200:
-                        st.success("가입 완료! 로그인 해주세요.")
-                    else:
-                        # 서버가 {"detail": "..."} 주면 그걸 우선 표시
-                        try:
-                            msg = r.json().get("detail") or r.text
-                        except Exception:
-                            msg = r.text
-                        st.error(msg)
-                except Exception as e:
-                    st.error(str(e))
+                # 클라 단 검증(선택)
+                if not (sid_r.isdigit() and len(sid_r) == 8):
+                    st.error("학번은 숫자 8자리여야 합니다.")
+                else:
+                    try:
+                        r = requests.post(
+                            f"{API}/auth/register",
+                            json={
+                                "email": email_r.strip().lower(),
+                                "team": team_r.strip(),
+                                "password": pw_r,
+                                "name": name_r.strip(),
+                                "student_id": sid_r.strip(),
+                            },
+                            timeout=30
+                        )
+                        if r.status_code == 200:
+                            st.success("가입 완료! 로그인 해주세요.")
+                        else:
+                            st.error(parse_err(r))
+                    except Exception as e:
+                        st.error(str(e))
+                        
     else:
         st.write(f"**팀:** {st.session_state.team}")
         st.write(f"역할: {'관리자' if st.session_state.is_admin else '참가자'}")
+        q = fetch_quota()
+        if q:
+            st.info(f"오늘 남은 제출: {q['remaining']}/{q['daily_limit']} (리셋: {q['reset_at_local']})")
         if st.button("로그아웃"):
             st.session_state.token = None
             st.session_state.team = None
             st.session_state.is_admin = False
             st.rerun()
+
+
 
 # -------- Helpers --------
 def show_board(endpoint_json, endpoint_csv, cols_order, headers=None, date_only=True):
@@ -160,6 +197,11 @@ with tab_objs[tab_idx]:
     if not st.session_state.token:
         st.warning("로그인 후 이용해주세요.")
     else:
+        # 상단에 현재 쿼터 노출
+        q = fetch_quota()
+        if q:
+            st.caption(f"오늘 남은 제출: {q['remaining']}/{q['daily_limit']} (리셋: {q['reset_at_local']})")
+
         sub = st.file_uploader("submission.csv (ID + y_pred)", type=["csv"])
         if st.button("제출"):
             if not sub:
@@ -170,9 +212,16 @@ with tab_objs[tab_idx]:
                     r = requests.post(f"{API}/submit", files=files, headers=authed_headers(), timeout=60)
                     if r.status_code == 200:
                         js = r.json()
-                        st.success(f"제출 완료! Public: {js.get('public_score')}  / Private: {'—' if js.get('private_score') is None else js.get('private_score')}")
+                        st.success(
+                            f"제출 완료! Public: {js.get('public_score')}  / "
+                            f"Private: {'—' if js.get('private_score') is None else js.get('private_score')}"
+                        )
+                        # ✅ 응답에 포함된 최신 쿼터로 갱신 표시
+                        if js.get("daily_limit") is not None:
+                            st.info(f"오늘 남은 제출: {js.get('remaining_today')}/{js.get('daily_limit')}")
                     else:
-                        st.error(f"{r.status_code} - {r.text}")
+                        # 한도 초과(429) 등 한국어 메시지 표시
+                        st.error(parse_err(r))
                 except Exception as e:
                     st.error(str(e))
 tab_idx += 1
@@ -304,7 +353,7 @@ if st.session_state.is_admin:
                 if r.status_code == 200:
                     st.session_state["_admin_subs"] = pd.DataFrame(r.json())
                 else:
-                    st.error(r.text)
+                    st.error(parse_err(r))
             except Exception as e:
                 st.error(str(e))
 
@@ -380,7 +429,7 @@ if st.session_state.is_admin:
                     if r.status_code == 200:
                         st.session_state["_admin_users"] = pd.DataFrame(r.json())
                     else:
-                        st.error(r.text)
+                        st.error(parse_err(r))
                 except Exception as e:
                     st.error(str(e))
 
@@ -397,8 +446,10 @@ if st.session_state.is_admin:
                     "email": st.column_config.TextColumn("아이디", disabled=True),
                     "team": st.column_config.TextColumn("팀", disabled=True),
                     "is_admin": st.column_config.CheckboxColumn("관리자", disabled=True),
+                    "name": st.column_config.TextColumn("이름", disabled=True),            # ✅
+                    "student_id": st.column_config.TextColumn("학번", disabled=True),      # ✅
                 },
-                disabled=["email","team","is_admin"],
+                disabled=["email","team","is_admin","name","student_id"],
             )
 
             colx, coly = st.columns([1,2])
