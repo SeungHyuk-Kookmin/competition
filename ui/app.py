@@ -359,28 +359,64 @@ if st.session_state.is_admin:
 
         df_subs = st.session_state.get("_admin_subs")
         if isinstance(df_subs, pd.DataFrame) and not df_subs.empty:
-            work = df_subs.copy()
-            work["삭제"] = False
+            # 필요한 컬럼만 추림 (백엔드에서 private_score는 이미 최종 리더보드(Private)와 동일 로직)
+            cols_needed = ["team", "id", "public_score", "private_score", "received_at"]
+            present = [c for c in cols_needed if c in df_subs.columns]
+            view = df_subs[present].copy()
+        
+            # 타입 정리 + 표시명 변경
+            if "id" in view.columns:
+                view["id"] = pd.to_numeric(view["id"], errors="coerce").astype("Int64")
+            rename_map = {
+                "team": "팀",
+                "id": "ID",
+                "public_score": "Public Score",
+                "private_score": "Private Score",
+                "received_at": "제출일시",
+            }
+            view = view.rename(columns=rename_map)
+        
+            # 체크박스 컬럼 추가
+            view["삭제"] = False
+        
+            # 컬럼 순서 강제
+            order = ["팀", "ID", "Public Score", "Private Score", "제출일시", "삭제"]
+            order = [c for c in order if c in view.columns]
+            view = view[order]
+        
             edited = st.data_editor(
-                work,
+                view,
                 hide_index=True,
                 use_container_width=True,
-                column_config={"삭제": st.column_config.CheckboxColumn("삭제", default=False)},
+                column_config={
+                    "팀": st.column_config.TextColumn("팀", disabled=True),
+                    "ID": st.column_config.NumberColumn("ID", disabled=True),
+                    "Public Score": st.column_config.NumberColumn("Public Score", disabled=True, format="%.6f"),
+                    "Private Score": st.column_config.NumberColumn("Private Score", disabled=True, format="%.6f"),
+                    "제출일시": st.column_config.TextColumn("제출일시", disabled=True),
+                    "삭제": st.column_config.CheckboxColumn("삭제", help="삭제할 제출 선택", default=False),
+                },
+                disabled=["팀", "ID", "Public Score", "Private Score", "제출일시"],
             )
-            if st.button("선택 제출 삭제", key="btn_delete_selected"):
-                ids = edited.loc[edited["삭제"], "id"].astype(int).tolist()
+        
+            if st.button("선택 제출 삭제", key="btn_delete_selected_clean"):
+                ids = edited.loc[edited["삭제"], "ID"]
+                ids = ids.dropna().astype(int).tolist() if "ID" in edited.columns else []
                 if not ids:
                     st.warning("선택된 제출이 없습니다.")
                 else:
                     ok, fail = 0, 0
                     for sid in ids:
                         rr = requests.delete(f"{API}/admin/submission/{sid}", headers=authed_headers(), timeout=30)
-                        ok += (rr.status_code == 200)
-                        fail += (rr.status_code != 200)
+                        if rr.status_code == 200:
+                            ok += 1
+                        else:
+                            fail += 1
                     st.success(f"삭제 완료: {ok}건, 실패: {fail}건")
                     st.session_state.pop("_admin_subs", None)
                     st.rerun()
-
+        else:
+            st.info("최근 제출이 없습니다.")
         st.divider()
 
         # 섹션 2: 팀 제출 전체 삭제
