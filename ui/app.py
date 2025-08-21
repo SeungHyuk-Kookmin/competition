@@ -378,18 +378,17 @@ if st.session_state.is_admin:
                 if r.status_code == 200:
                     st.session_state["_admin_subs"] = pd.DataFrame(r.json())
                 else:
+                    # 한국어 에러 파싱
                     st.error(parse_err(r))
             except Exception as e:
                 st.error(str(e))
 
         df_subs = st.session_state.get("_admin_subs")
         if isinstance(df_subs, pd.DataFrame) and not df_subs.empty:
-            # 필요한 컬럼만 추림 (백엔드에서 private_score는 이미 최종 리더보드(Private)와 동일 로직)
             cols_needed = ["team", "id", "public_score", "private_score", "received_at"]
             present = [c for c in cols_needed if c in df_subs.columns]
             view = df_subs[present].copy()
         
-            # 타입 정리 + 표시명 변경
             if "id" in view.columns:
                 view["id"] = pd.to_numeric(view["id"], errors="coerce").astype("Int64")
             rename_map = {
@@ -401,10 +400,7 @@ if st.session_state.is_admin:
             }
             view = view.rename(columns=rename_map)
         
-            # 체크박스 컬럼 추가
             view["삭제"] = False
-        
-            # 컬럼 순서 강제
             order = ["팀", "ID", "Public Score", "Private Score", "제출일시", "삭제"]
             order = [c for c in order if c in view.columns]
             view = view[order]
