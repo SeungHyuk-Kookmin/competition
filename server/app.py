@@ -667,13 +667,44 @@ def admin_list_submissions(request: Request, team: Optional[str] = None, limit: 
             q = q.where(Submission.team == team)
         q = q.order_by(Submission.received_at.desc()).limit(limit)
         rows = s.exec(q).all()
-    return [{
-        "id": r.id, "team": r.team,
-        "received_at": ts_kst(r.received_at),
-        "public_score": r.public_score, "private_score": r.private_score,
-        "rows_public": r.rows_public, "rows_private": r.rows_private,
-        "warning": r.warning
-    } for r in rows]
+
+        # 원본 CSV 경로 미리 모아두기
+        ids = [r.id for r in rows]
+        sfiles = s.exec(select(SubFile).where(SubFile.submission_id.in_(ids))).all()
+
+    file_map = {sf.submission_id: sf for sf in sfiles}
+
+    out = []
+    for r in rows:
+        # ✅ 최종 리더보드(Private)와 동일한 스코어 산출 로직:
+        # 1) GT_ALL로 재채점 성공 시 그 값을 사용
+        # 2) 실패하거나 파일 없으면 기존 저장된 private_score 폴백
+        final_like_private = None
+        sf = file_map.get(r.id)
+        if GT_ALL is not None and sf and sf.path and os.path.exists(sf.path):
+            sc, _rows, _w = _score_file_on_gt(sf.path, GT_ALL)
+            if sc is not None:
+                final_like_private = float(sc)
+        if final_like_private is None and r.private_score is not None:
+            final_like_private = float(r.private_score)
+
+        item = {
+            "id": r.id,
+            "team": r.team,
+            "received_at": ts_kst(r.received_at),
+            "public_score": r.public_score,
+            # ⬇️ 여기의 private_score가 이제 ‘최종 리더보드(Private)’와 동일 로직
+            "private_score": round(final_like_private, 6) if final_like_private is not None else None,
+            # 참고용으로 원래 저장치도 함께 내려줌(원치 않으면 이 줄 삭제)
+            # "private_score_raw": round(float(r.private_score), 6) if r.private_score is not None else None,
+            "rows_public": r.rows_public,
+            "rows_private": r.rows_private,
+            "warning": r.warning,
+        }
+        out.append(item)
+
+    return out
+
 
 # 개별 제출 삭제
 @app.delete("/admin/submission/{submission_id}", response_model=DeleteReport)
