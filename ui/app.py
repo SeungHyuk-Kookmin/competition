@@ -193,7 +193,7 @@ tab_idx = 0
 
 # --- 제출 업로드 ---
 with tab_objs[tab_idx]:
-    st.subheader("Upload Submission (로그인 필요)")
+    st.subheader("Upload Submission")
     if not st.session_state.token:
         st.warning("로그인 후 이용해주세요.")
     else:
