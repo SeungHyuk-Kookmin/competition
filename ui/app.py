@@ -15,6 +15,8 @@ try:
 except Exception:
     pass
 
+# 서버 상태
+final_private_visibility = info.get("final_private_visibility", "admin")  # "admin" | "public"
 private_visibility = info.get("private_visibility", "hidden")
 private_release_at = info.get("private_release_at_kst")
 private_released = info.get("private_released", False)
@@ -28,7 +30,6 @@ def parse_err(resp):
         js = resp.json()
     except Exception:
         return resp.text
-    # FastAPI 표준(detail), 커스텀(code/message) 모두 처리
     if isinstance(js, dict):
         if "message" in js:
             return js.get("message")
@@ -48,8 +49,25 @@ if "token" not in st.session_state:
 def authed_headers():
     return {"Authorization": f"Bearer {st.session_state.token}"} if st.session_state.token else {}
 
-# -------- Sidebar: Auth --------
+# 로그인 상태 재검증(관리자 플래그 정확화)
+def refresh_identity():
+    if st.session_state.token:
+        try:
+            r = requests.get(f"{API}/auth/me", headers=authed_headers(), timeout=10)
+            if r.status_code == 200:
+                me = r.json()
+                st.session_state.team = me.get("team") or st.session_state.team
+                st.session_state.is_admin = bool(me.get("is_admin", False))
+            else:
+                st.session_state.token = None
+                st.session_state.team = None
+                st.session_state.is_admin = False
+        except Exception:
+            pass
 
+refresh_identity()
+
+# -------- Sidebar: Auth --------
 def fetch_quota():
     if not st.session_state.token:
         return None
@@ -87,11 +105,10 @@ with st.sidebar:
         with tab_register:
             email_r = st.text_input("아이디", key="reg_email")
             team_r = st.text_input("팀명", key="reg_team")
-            name_r = st.text_input("이름", key="reg_name")                 # ✅
-            sid_r  = st.text_input("학번(숫자 8자리)", key="reg_sid")       # ✅
+            name_r = st.text_input("이름", key="reg_name")
+            sid_r  = st.text_input("학번(숫자 8자리)", key="reg_sid")
             pw_r = st.text_input("패스워드", type="password", key="reg_pw")
             if st.button("회원가입"):
-                # 클라 단 검증(선택)
                 if not (sid_r.isdigit() and len(sid_r) == 8):
                     st.error("학번은 숫자 8자리여야 합니다.")
                 else:
@@ -113,7 +130,6 @@ with st.sidebar:
                             st.error(parse_err(r))
                     except Exception as e:
                         st.error(str(e))
-                        
     else:
         st.write(f"**팀:** {st.session_state.team}")
         st.write(f"역할: {'관리자' if st.session_state.is_admin else '참가자'}")
@@ -126,8 +142,6 @@ with st.sidebar:
             st.session_state.is_admin = False
             st.rerun()
 
-
-
 # -------- Helpers --------
 def show_board(endpoint_json, endpoint_csv, cols_order, headers=None, date_only=True, labels=None):
     c1, c2 = st.columns([3, 1])
@@ -139,29 +153,29 @@ def show_board(endpoint_json, endpoint_csv, cols_order, headers=None, date_only=
                 if not df.empty:
                     if date_only and "received_at" in df.columns:
                         df["date"] = df["received_at"].astype(str).str[:10]
-
                     cols = [("date" if c == "received_at" else c) for c in cols_order]
-
                     rename = {
                         "team": "팀",
                         "submission_id": "ID",
                         "public_score": "Public Score",
                         "private_score": "Private Score",
                         "submit_count": "제출수",
-                        "date": "등록일",   # ✅ 기본값을 '등록일'로
+                        "date": "등록일",
                     }
                     if labels:
                         rename.update(labels)
-
                     present = [c for c in cols if c in df.columns]
                     disp = df.rename(columns=rename)
+                    if not present:
+                        st.warning("표시할 컬럼을 찾지 못했습니다. 전체 응답을 표시합니다.")
+                        st.dataframe(disp, use_container_width=True)
+                        return
                     disp_cols = [rename.get(c, c) for c in present]
-
                     st.dataframe(disp[disp_cols], use_container_width=True)
                 else:
                     st.info("데이터가 없습니다.")
             else:
-                st.error(f"{r.status_code} - {r.text}")
+                st.error(f"{r.status_code} - {parse_err(r)}")
         except Exception as e:
             st.error(f"요청 실패: {e}")
 
@@ -170,21 +184,24 @@ def add_tab(tabs_list, name):
     if name not in tabs_list:
         tabs_list.append(name)
 
-# private 탭 노출 조건
+# 탭 노출 조건
+IS_ADMIN = bool(st.session_state.is_admin)
 show_private_tab = (
     (private_visibility in ("public", "public_after")) or
-    (private_visibility == "admin" and st.session_state.is_admin)
+    (private_visibility == "admin" and IS_ADMIN)
 )
-show_final_tabs = st.session_state.is_admin
+show_final_public_tab  = IS_ADMIN                                  # 최종(Public): 관리자 전용
+show_final_private_tab = IS_ADMIN or (final_private_visibility == "public")  # 최종(Private): 관리자 or 전체공개
 
+# 탭 추가
 tabs = ["Upload Submission", "Score(Public)", "리더보드(Public)"]
 if show_private_tab:
     add_tab(tabs, "리더보드(Private)")
-if show_final_tabs:
+if show_final_public_tab:
     add_tab(tabs, "최종 리더보드(Public)")
+if show_final_private_tab:
     add_tab(tabs, "최종 리더보드(Private)")
-
-if st.session_state.is_admin:
+if IS_ADMIN:
     add_tab(tabs, "관리자 도구")
 
 tab_objs = st.tabs(tabs)
@@ -196,11 +213,9 @@ with tab_objs[tab_idx]:
     if not st.session_state.token:
         st.warning("로그인 후 이용해주세요.")
     else:
-        # 상단에 현재 쿼터 노출
         q = fetch_quota()
         if q:
-            st.caption(f"오늘 남은 제출: {q['remaining']}/{q['daily_limit']} (리셋: {q['reset_at_local']})")
-
+            st.caption(f"오늘 남은 제출: {q['remaining']}/{q['daily_limit']} (리셋: {q.get('reset_at_local','00:00 KST')})")
         sub = st.file_uploader("submission.csv (ID + y_pred)", type=["csv"])
         if st.button("제출"):
             if not sub:
@@ -215,11 +230,9 @@ with tab_objs[tab_idx]:
                             f"제출 완료! Public: {js.get('public_score')}  / "
                             f"Private: {'—' if js.get('private_score') is None else js.get('private_score')}"
                         )
-                        # ✅ 응답에 포함된 최신 쿼터로 갱신 표시
                         if js.get("daily_limit") is not None:
                             st.info(f"오늘 남은 제출: {js.get('remaining_today')}/{js.get('daily_limit')}")
                     else:
-                        # 한도 초과(429) 등 한국어 메시지 표시
                         st.error(parse_err(r))
                 except Exception as e:
                     st.error(str(e))
@@ -233,39 +246,24 @@ with tab_objs[tab_idx]:
     else:
         r = requests.get(f"{API}/my_score", headers=authed_headers(), timeout=30)
         if r.status_code != 200:
-            st.error(f"{r.status_code} - {r.text}")
+            st.error(f"{r.status_code} - {parse_err(r)}")
         else:
             js = r.json()
-
-            # 상단 베스트 (Public만)
             best_pub = js.get("best_public") or {}
-            bst_date = (best_pub.get("received_at") or "")[:10]  # YYYY-MM-DD만
+            bst_date = (best_pub.get("received_at") or "")[:10]
             st.metric("Best Public Score", value=f"{best_pub.get('public_score'):.6f}" if best_pub.get("public_score") is not None else "—")
             st.caption(f"submission_id: {best_pub.get('submission_id')}, date {bst_date}")
-
             st.divider()
-
-            # 히스토리: public만 보이게 + 한국시간 포맷
             hist = pd.DataFrame(js.get("history") or [])
             if not hist.empty:
-                # 날짜 열 생성 (문자열 앞 10자리만 사용)
                 hist["date_only"] = hist["received_at"].astype(str).str[:10]
-
-                # 날짜만 보이는 뷰
                 view = hist[["submission_id", "date_only", "public_score"]].copy()
-                view = view.rename(columns={
-                    "submission_id": "ID",
-                    "date_only": "제출일",
-                    "public_score": "Public Score"
-                })
-
+                view = view.rename(columns={"submission_id": "ID", "date_only": "제출일", "public_score": "Public Score"})
                 st.write("#### Submission History")
                 st.dataframe(view, use_container_width=True)
-
                 st.write("#### 최종 후보 선택 (최대 2개)")
                 pick_df = view.copy()
                 pick_df["선택"] = False
-
                 edited = st.data_editor(
                     pick_df,
                     hide_index=True,
@@ -273,12 +271,11 @@ with tab_objs[tab_idx]:
                     column_config={
                         "선택": st.column_config.CheckboxColumn("선택", help="최대 2개 선택", default=False),
                         "ID": st.column_config.NumberColumn("ID", disabled=True),
-                        "제출일": st.column_config.TextColumn("제출일", disabled=True),  # ⬅ 날짜만
+                        "제출일": st.column_config.TextColumn("제출일", disabled=True),
                         "Public Score": st.column_config.NumberColumn("Public Score", disabled=True, format="%.6f"),
                     },
                     disabled=["ID","제출일","Public Score"],
                 )
-
                 if st.button("최종 후보 등록"):
                     picked_ids = edited.loc[edited["선택"], "ID"].astype(int).tolist()
                     if len(picked_ids) == 0:
@@ -287,11 +284,11 @@ with tab_objs[tab_idx]:
                         st.error("최대 2개까지만 선택할 수 있어요.")
                     else:
                         r2 = requests.post(f"{API}/finalize", headers=authed_headers(),
-                                        json={"submission_ids": picked_ids}, timeout=30)
+                                           json={"submission_ids": picked_ids}, timeout=30)
                         if r2.status_code == 200:
                             st.success(f"최종 후보 등록 완료! 선택: {picked_ids}")
                         else:
-                            st.error(f"{r2.status_code} - {r2.text}")
+                            st.error(f"{r2.status_code} - {parse_err(r2)}")
             else:
                 st.info("아직 제출 기록이 없습니다.")
 tab_idx += 1
@@ -322,9 +319,8 @@ if show_private_tab:
             )
     tab_idx += 1
 
-# ✅ 최종 리더보드 렌더링은 반드시 show_private_tab 블록 '밖에서' 수행
-if show_final_tabs:
-    # --- 최종 리더보드 (Public, 관리자 전용) ---
+# --- 최종 리더보드 (Public, 관리자 전용) ---
+if show_final_public_tab:
     with tab_objs[tab_idx]:
         st.subheader("최종 리더보드 (Public, best-of-two)")
         show_board(
@@ -335,23 +331,64 @@ if show_final_tabs:
         )
     tab_idx += 1
 
-    # --- 최종 리더보드 (Private, 관리자 전용 또는 정책에 따라) ---
+# --- 최종 리더보드 (Private, 관리자 or 전체공개) ---
+if show_final_private_tab:
     with tab_objs[tab_idx]:
         st.subheader("최종 리더보드 (Private, best-of-two)")
+        need_auth = (final_private_visibility == "admin")  # admin 모드면 토큰 필요
         show_board(
             "/final/leaderboard_private", "/final/leaderboard_private_csv",
             ["team", "public_score", "private_score", "submit_count", "received_at"],
-            headers=authed_headers(),  # 관리자만 보게 할거면 헤더 필수
+            headers=authed_headers() if need_auth else None,
             labels={"public_score": "Public", "private_score": "Private", "date": "등록일"}
         )
     tab_idx += 1
-    
+
 # --- 관리자 도구 ---
-if st.session_state.is_admin:
+if IS_ADMIN:
     with tab_objs[-1]:
         st.subheader("관리자 도구")
 
-        # 섹션 1: 최근 제출 조회 & 선택 삭제
+        # 최종 리더보드(Private) 공개 설정 (선택형)
+        st.markdown("#### 최종 리더보드(Private) 공개 설정")
+        try:
+            rset = requests.get(f"{API}/admin/settings", headers=authed_headers(), timeout=15)
+            cur_vis = (rset.json().get("final_private_visibility")
+                       if rset.status_code == 200 else final_private_visibility)
+        except Exception:
+            cur_vis = final_private_visibility
+
+        label_to_val = {"관리자만": "admin", "전체 공개": "public"}
+        val_to_label = {v: k for k, v in label_to_val.items()}
+        default_idx = 0 if cur_vis == "admin" else 1
+
+        choice = st.selectbox(
+            "공개 범위를 선택하세요",
+            ["관리자만", "전체 공개"],
+            index=default_idx,
+            help="끄면 관리자만 볼 수 있고, 켜면 모든 참가자가 볼 수 있습니다."
+        )
+
+        if st.button("설정 적용", key="btn_apply_final_private_vis"):
+            try:
+                new_vis = label_to_val[choice]
+                r = requests.post(
+                    f"{API}/admin/settings",
+                    headers=authed_headers(),
+                    json={"final_private_visibility": new_vis},
+                    timeout=20,
+                )
+                if r.status_code == 200:
+                    st.success("설정이 적용되었습니다.")
+                    st.rerun()
+                else:
+                    st.error(parse_err(r))
+            except Exception as e:
+                st.error(str(e))
+
+        st.caption(f"현재 상태: **{val_to_label.get(cur_vis, cur_vis)}**")
+
+        # 섹션 1: 최근 제출 조회/삭제
         st.markdown("#### 최근 제출 조회/삭제")
         colf1, colf2 = st.columns([2, 1])
         with colf1:
@@ -368,7 +405,6 @@ if st.session_state.is_admin:
                 if r.status_code == 200:
                     st.session_state["_admin_subs"] = pd.DataFrame(r.json())
                 else:
-                    # 한국어 에러 파싱
                     st.error(parse_err(r))
             except Exception as e:
                 st.error(str(e))
@@ -378,7 +414,7 @@ if st.session_state.is_admin:
             cols_needed = ["team", "id", "public_score", "private_score", "received_at"]
             present = [c for c in cols_needed if c in df_subs.columns]
             view = df_subs[present].copy()
-        
+
             if "id" in view.columns:
                 view["id"] = pd.to_numeric(view["id"], errors="coerce").astype("Int64")
             rename_map = {
@@ -389,12 +425,12 @@ if st.session_state.is_admin:
                 "received_at": "제출일시",
             }
             view = view.rename(columns=rename_map)
-        
+
             view["삭제"] = False
             order = ["팀", "ID", "Public Score", "Private Score", "제출일시", "삭제"]
             order = [c for c in order if c in view.columns]
             view = view[order]
-        
+
             edited = st.data_editor(
                 view,
                 hide_index=True,
@@ -409,7 +445,7 @@ if st.session_state.is_admin:
                 },
                 disabled=["팀", "ID", "Public Score", "Private Score", "제출일시"],
             )
-        
+
             if st.button("선택 제출 삭제", key="btn_delete_selected_clean"):
                 ids = edited.loc[edited["삭제"], "ID"]
                 ids = ids.dropna().astype(int).tolist() if "ID" in edited.columns else []
@@ -458,8 +494,7 @@ if st.session_state.is_admin:
                 )
                 st.write(rr.status_code, rr.text)
 
-
-        # ==== 계정 삭제(체크박스) ====
+        # 계정 목록/삭제
         st.markdown("#### 계정 목록/삭제 (체크박스)")
         c1, c2, c3 = st.columns([2,1,1])
         with c1:
@@ -493,8 +528,8 @@ if st.session_state.is_admin:
                     "email": st.column_config.TextColumn("아이디", disabled=True),
                     "team": st.column_config.TextColumn("팀", disabled=True),
                     "is_admin": st.column_config.CheckboxColumn("관리자", disabled=True),
-                    "name": st.column_config.TextColumn("이름", disabled=True),            # ✅
-                    "student_id": st.column_config.TextColumn("학번", disabled=True),      # ✅
+                    "name": st.column_config.TextColumn("이름", disabled=True),
+                    "student_id": st.column_config.TextColumn("학번", disabled=True),
                 },
                 disabled=["email","team","is_admin","name","student_id"],
             )
@@ -510,11 +545,10 @@ if st.session_state.is_admin:
                 if target.empty:
                     st.warning("선택된 계정이 없습니다.")
                 else:
-                    ok, skip, fail = 0, 0, 0
+                    ok, skip, fail = 0, 0
                     for _, row in target.iterrows():
                         email = str(row["email"]).strip().lower()
                         is_admin_flag = bool(row["is_admin"])
-                        # 관리자 보호(체크 안했으면 스킵)
                         if is_admin_flag and not allow_admin_del:
                             skip += 1
                             continue
@@ -532,7 +566,6 @@ if st.session_state.is_admin:
                         except Exception:
                             fail += 1
                     st.success(f"삭제 완료: {ok}건, 관리자 보호로 미삭제: {skip}건, 실패: {fail}건")
-                    # 목록 갱신
                     st.session_state.pop("_admin_users", None)
                     st.rerun()
         else:
