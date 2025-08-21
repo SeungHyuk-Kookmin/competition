@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Depends
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -9,59 +9,18 @@ from typing import Optional, Tuple, List
 import pandas as pd
 import numpy as np
 from sklearn.metrics import roc_auc_score
-import io, os, logging, hashlib
-from sqlalchemy import func, UniqueConstraint
+import io, os, logging
+from sqlalchemy import func, UniqueConstraint, delete
 from jose import jwt, JWTError
 from passlib.context import CryptContext
-from sqlalchemy import func, UniqueConstraint, delete
 
 logger = logging.getLogger("uvicorn.error")
 
-KST = timezone(timedelta(hours=9))
-
-PRIVATE_VISIBILITY = os.getenv("PRIVATE_VISIBILITY", "hidden")  # hidden | admin | public | public_after
-PRIVATE_RELEASE_AT = os.getenv("PRIVATE_RELEASE_AT", "2025-08-29-14-00-00").strip()  # 예: "2025-08-21-09-00-00" 또는 "2025-08-21 09:00:00" 또는 "2025-08-21"
-
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
-# --- models ---
-class Setting(SQLModel, table=True):
-    key: str = Field(primary_key=True)
-    value: str
-
-# --- defaults ---
-FINAL_PRIVATE_VISIBILITY_DEFAULT = os.getenv("FINAL_PRIVATE_VISIBILITY", "admin")  # admin|public
-
-# --- helpers ---
-def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
-    with Session(engine) as s:
-        row = s.get(Setting, key)
-        return row.value if row else default
-
-def set_setting(key: str, value: str):
-    with Session(engine) as s:
-        row = s.get(Setting, key)
-        if row:
-            row.value = value
-        else:
-            row = Setting(key=key, value=value)
-            s.add(row)
-        s.commit()
-
-def _has_final_private_access(request: Request, user: Optional[User]) -> bool:
-    # 1) 관리자 / X-ADMIN-KEY는 항상 허용
-    if user and getattr(user, "is_admin", False):
-        return True
-    key = request.headers.get("X-ADMIN-KEY", "")
-    if ADMIN_KEY and key == ADMIN_KEY:
-        return True
-    # 2) 설정 확인
-    vis = get_setting("final_private_visibility", FINAL_PRIVATE_VISIBILITY_DEFAULT)
-    return vis == "public"
-
+# -------------------- Time & TZ --------------------
 # ✅ 고정 KST (DST 없음)
 KST = timezone(timedelta(hours=9))
-TZ_NAME = "Asia/Seoul"  # 표기용
+TZ_NAME = os.getenv("TZ", "Asia/Seoul")  # 표기용만 사용
+
 def ts_kst(dt: datetime) -> str:
     return dt.astimezone(KST).strftime("%Y-%m-%d-%H-%M-%S")
 
@@ -71,7 +30,6 @@ def _parse_release_at_kst(s: str):
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d-%H-%M-%S", "%Y-%m-%d"):
         try:
             dt = datetime.strptime(s, fmt)
-            # 날짜만 주면 00:00:00으로
             if fmt == "%Y-%m-%d":
                 dt = datetime.strptime(s + " 00:00:00", "%Y-%m-%d %H:%M:%S")
             return dt.replace(tzinfo=KST)
@@ -79,26 +37,14 @@ def _parse_release_at_kst(s: str):
             pass
     return None
 
+# -------------------- ENV --------------------
+PRIVATE_VISIBILITY = os.getenv("PRIVATE_VISIBILITY", "hidden")  # hidden | admin | public | public_after
+PRIVATE_RELEASE_AT = os.getenv("PRIVATE_RELEASE_AT", "2025-08-29-14-00-00").strip()
 RELEASE_AT_KST = _parse_release_at_kst(PRIVATE_RELEASE_AT)
-
-def ts_kst(dt: datetime) -> str:
-    return dt.astimezone(KST).strftime("%Y-%m-%d-%H-%M-%S")
-
-def admin_required(request: Request):  # ← 반환 타입 힌트 빼기(또는 위의 __future__ 사용)
-    u = _get_current_user(request)
-    if u and getattr(u, "is_admin", False):
-        return u
-    key = request.headers.get("X-ADMIN-KEY", "")
-    if ADMIN_KEY and key == ADMIN_KEY:
-        return u  # u가 None이어도 키로 통과 허용
-    raise HTTPException(status_code=403, detail="Admins only.")
 
 SUBMIT_SAVE_DIR = os.getenv("SUBMIT_SAVE_DIR", "./submissions")
 os.makedirs(SUBMIT_SAVE_DIR, exist_ok=True)
 
-# ================== 설정 ==================
-TZ_NAME = os.getenv("TZ", "Asia/Seoul")
-TZ = ZoneInfo(TZ_NAME)
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "10"))
 
 ID_COL  = os.getenv("ID_COL", "ID")
@@ -111,8 +57,7 @@ DB_URL = os.getenv("DATABASE_URL", "sqlite:///./leaderboard.db")
 KEEP_BEST_PER_TEAM = True
 PRED_CANDIDATES = [os.getenv("PRED_COL", "y_pred"), "pred", "prob", "probability", "score"]
 
-# private 가시성: "hidden" | "admin" | "public"
-PRIVATE_VISIBILITY = os.getenv("PRIVATE_VISIBILITY", "hidden")
+# private 가시성: "hidden" | "admin" | "public" | "public_after"
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")  # (옵션) 관리자 헤더 백도어
 
 # JWT
@@ -120,17 +65,23 @@ SECRET_KEY = os.getenv("SECRET_KEY", "dev-insecure-secret-change-me")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "720"))
 
-def create_access_token(data: dict, minutes: int = ACCESS_TOKEN_EXPIRE_MINUTES) -> str:
-    to_encode = data.copy()
-    to_encode.update({"exp": datetime.utcnow() + timedelta(minutes=minutes)})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+# 최종 리더보드 private 공개 정책(설정 기본값)
+FINAL_PRIVATE_VISIBILITY_DEFAULT = os.getenv("FINAL_PRIVATE_VISIBILITY", "admin")  # admin|public
 
-# =========================================
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# -------------------- FastAPI --------------------
 app = FastAPI(title="Competition Scoring API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ================== DB 모델 ==================
+# -------------------- DB Engine --------------------
+engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
+
+# -------------------- Models --------------------
+class Setting(SQLModel, table=True):
+    key: str = Field(primary_key=True)
+    value: str
+
 class Submission(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     team: str
@@ -154,22 +105,26 @@ class User(SQLModel, table=True):
     team: str
     password_hash: str
     is_admin: bool = False
-
-    # ✅ 신규 필드
+    # 신규 필드
     name: Optional[str] = None
     student_id: Optional[str] = Field(default=None, index=True)
-
     __table_args__ = (
         UniqueConstraint("email", name="uix_user_email"),
-        # UniqueConstraint("team", name="uix_user_team"),  # 그대로 비활성
+        # 팀명 중복 허용 (경험상 팀명 재사용 이슈 회피 목적)
+        # UniqueConstraint("team", name="uix_user_team"),
     )
 
-# SQLite 멀티스레드 허용
-engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
+class SubFile(SQLModel, table=True):
+    submission_id: int = Field(primary_key=True)
+    team: str
+    path: str
+    orig_name: Optional[str] = None
+
+# 테이블 생성(단 한 번만)
 SQLModel.metadata.create_all(engine)
 
 def _ensure_user_columns():
-    # SQLite 전용 간단 마이그레이션
+    # SQLite 전용 간단 마이그레이션: user.name, user.student_id 없으면 추가
     try:
         with engine.connect() as conn:
             cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info('user')").fetchall()}
@@ -182,7 +137,23 @@ def _ensure_user_columns():
 
 _ensure_user_columns()
 
-# --------- Ground Truth 로드 ---------
+# -------------------- Settings helpers --------------------
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    with Session(engine) as s:
+        row = s.get(Setting, key)
+        return row.value if row else default
+
+def set_setting(key: str, value: str):
+    with Session(engine) as s:
+        row = s.get(Setting, key)
+        if row:
+            row.value = value
+        else:
+            row = Setting(key=key, value=value)
+            s.add(row)
+        s.commit()
+
+# -------------------- GT Load --------------------
 GT_PUBLIC = None
 if os.path.exists(GT_PUBLIC_PATH):
     GT_PUBLIC = pd.read_csv(GT_PUBLIC_PATH)
@@ -199,73 +170,17 @@ if os.path.exists(GT_PRIVATE_PATH):
 
 if GT_PUBLIC is None and GT_PRIVATE is None:
     raise RuntimeError("At least one of public/private GT must exist.")
-# -------------------------------------
 
 GT_ALL = None
 if GT_PUBLIC is not None and GT_PRIVATE is not None:
     GT_ALL = pd.concat([GT_PUBLIC, GT_PRIVATE], ignore_index=True)
-    # ID 중복이 있으면 첫 라벨을 사용 (일반적으로 disjoint)
     GT_ALL = GT_ALL.drop_duplicates(subset=[ID_COL], keep="first")
 elif GT_PUBLIC is not None:
     GT_ALL = GT_PUBLIC.copy()
 elif GT_PRIVATE is not None:
     GT_ALL = GT_PRIVATE.copy()
 
-class SubFile(SQLModel, table=True):
-    submission_id: int = Field(primary_key=True)
-    team: str
-    path: str
-    orig_name: Optional[str] = None
-
-SQLModel.metadata.create_all(engine)
-
-# === admin helper ===
-def _require_admin(request: Request):
-    u = _get_current_user(request)
-    if u and u.is_admin:
-        return u
-    key = request.headers.get("X-ADMIN-KEY", "")
-    if ADMIN_KEY and key == ADMIN_KEY:
-        return None
-    raise HTTPException(status_code=403, detail="admin only")
-
-class DeleteReport(BaseModel):
-    deleted_submissions: int = 0
-    removed_final_picks: int = 0
-    removed_files: int = 0
-    deleted_users: int = 0
-
-def _delete_submissions_by_ids(ids: List[int]) -> DeleteReport:
-    rep = DeleteReport()
-    if not ids:
-        return rep
-    with Session(engine) as s:
-        # FinalPick 정리
-        rep.removed_final_picks = s.exec(
-            select(func.count()).select_from(FinalPick).where(FinalPick.submission_id.in_(ids))
-        ).one()
-        s.exec(delete(FinalPick).where(FinalPick.submission_id.in_(ids)))
-
-        # 파일 삭제
-        sfiles = s.exec(select(SubFile).where(SubFile.submission_id.in_(ids))).all()
-        for sf in sfiles:
-            try:
-                if sf.path and os.path.exists(sf.path):
-                    os.remove(sf.path)
-                    rep.removed_files += 1
-            except Exception:
-                pass
-        s.exec(delete(SubFile).where(SubFile.submission_id.in_(ids)))
-
-        # 제출 삭제
-        rep.deleted_submissions = s.exec(
-            select(func.count()).select_from(Submission).where(Submission.id.in_(ids))
-        ).one()
-        s.exec(delete(Submission).where(Submission.id.in_(ids)))
-        s.commit()
-    return rep
-
-# ================== 유틸/보안 ==================
+# -------------------- Auth / Security --------------------
 def hash_password(pw: str) -> str:
     return pwd_context.hash(pw)
 
@@ -275,6 +190,11 @@ def verify_password(pw: str, pw_hash: str) -> bool:
 def get_user_by_email(email: str) -> Optional[User]:
     with Session(engine) as s:
         return s.exec(select(User).where(User.email == email)).first()
+
+def create_access_token(data: dict, minutes: int = ACCESS_TOKEN_EXPIRE_MINUTES) -> str:
+    to_encode = data.copy()
+    to_encode.update({"exp": datetime.utcnow() + timedelta(minutes=minutes)})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 def _get_current_user(request: Request) -> Optional[User]:
     auth = request.headers.get("Authorization", "")
@@ -291,6 +211,16 @@ def _get_current_user(request: Request) -> Optional[User]:
     except JWTError:
         return None
 
+def admin_required(request: Request):
+    # 반환 타입 힌트 생략(전방참조 이슈 회피)
+    u = _get_current_user(request)
+    if u and getattr(u, "is_admin", False):
+        return u
+    key = request.headers.get("X-ADMIN-KEY", "")
+    if ADMIN_KEY and key == ADMIN_KEY:
+        return u  # u가 None이어도 키로 통과 허용
+    raise HTTPException(status_code=403, detail="Admins only.")
+
 def _require_user(request: Request) -> User:
     user = _get_current_user(request)
     if not user:
@@ -304,41 +234,37 @@ def _has_private_access(request: Request, user: Optional[User]) -> bool:
     key = request.headers.get("X-ADMIN-KEY", "")
     if ADMIN_KEY and key == ADMIN_KEY:
         return True
-
     # 2) 가시성 정책
     if PRIVATE_VISIBILITY == "public":
         return True
-    if PRIVATE_VISIBILITY == "admin":
-        return False
-    if PRIVATE_VISIBILITY == "hidden":
+    if PRIVATE_VISIBILITY in ("admin", "hidden"):
         return False
     if PRIVATE_VISIBILITY == "public_after":
         now_kst = datetime.now(timezone.utc).astimezone(KST)
         return bool(RELEASE_AT_KST and now_kst >= RELEASE_AT_KST)
-
     return False
 
-def _submit_count_map() -> dict:
-    with Session(engine) as s:
-        rows = s.exec(
-            select(Submission.team, func.count(Submission.id))
-            .group_by(Submission.team)
-        ).all()
-    return {team: int(cnt) for team, cnt in rows}
+def _has_final_private_access(request: Request, user: Optional[User]) -> bool:
+    if user and getattr(user, "is_admin", False):
+        return True
+    key = request.headers.get("X-ADMIN-KEY", "")
+    if ADMIN_KEY and key == ADMIN_KEY:
+        return True
+    vis = get_setting("final_private_visibility", FINAL_PRIVATE_VISIBILITY_DEFAULT)
+    return vis == "public"
 
-# ================== 채점 유틸 ==================
+# -------------------- Scoring utils --------------------
 def _pick_pred_column(df: pd.DataFrame, *, strict: bool = False) -> str:
     # 허용 이름 우선
     for c in PRED_CANDIDATES:
         if c in df.columns:
             return c
-    # 엄격 모드면 허용 이름이 없을 때 바로 형식 오류
     if strict:
         raise HTTPException(status_code=400, detail={
             "code": "BAD_SUBMISSION_FORMAT",
             "message": "제출 양식이 맞지 않습니다."
         })
-    # (비엄격 모드) 숫자 컬럼 자동 선택 - 관리자/내부 용도로만 사용
+    # (비엄격) 숫자 컬럼 자동 선택 - 관리자/내부 용도
     numeric_cols = [c for c in df.columns if c != ID_COL and pd.api.types.is_numeric_dtype(df[c])]
     if not numeric_cols:
         raise HTTPException(status_code=400, detail={
@@ -347,7 +273,7 @@ def _pick_pred_column(df: pd.DataFrame, *, strict: bool = False) -> str:
         })
     numeric_cols.sort(key=lambda c: float(pd.to_numeric(df[c], errors="coerce").notna().mean()), reverse=True)
     return numeric_cols[0]
-    
+
 def _validate_and_score(
     sub_df: pd.DataFrame,
     gt_df: pd.DataFrame,
@@ -360,17 +286,17 @@ def _validate_and_score(
 
     # ID 컬럼 정리
     if ID_COL not in df.columns:
-        for g in ["id","Id","ID"]:
+        for g in ["id", "Id", "ID"]:
             if g in df.columns:
                 df = df.rename(columns={g: ID_COL}); break
         if ID_COL not in df.columns:
-            # 형식 오류 통일
             raise HTTPException(status_code=400, detail={
                 "code": "BAD_SUBMISSION_FORMAT",
                 "message": "제출 양식이 맞지 않습니다."
             })
 
     df[ID_COL] = df[ID_COL].astype(str)
+    # ✅ require_named_pred 적용
     pred_col = _pick_pred_column(df, strict=require_named_pred)
 
     # 중복 ID는 즉시 에러
@@ -388,26 +314,23 @@ def _validate_and_score(
     sub_ids = set(df[ID_COL].astype(str))
     missing_ids = gt_ids - sub_ids
 
-    # ✅ 전체 매칭 강제: 제출된 해당 ID들의 예측값이 NaN이면 안 됨
-    # (즉, GT와 겹치는 ID들 한정으로 NaN 검사)
+    # ✅ 전체 매칭 강제: 제출된 해당 ID들의 예측값 NaN 금지
     df_in_gt = df[df[ID_COL].isin(gt_ids)]
     nan_bad = set(df_in_gt.loc[df_in_gt[pred_col].isna(), ID_COL].astype(str))
 
     if require_full and (missing_ids or nan_bad):
-        # 통일된 한국어 메시지
         raise HTTPException(status_code=400, detail={
             "code": "BAD_SUBMISSION_FORMAT",
             "message": "제출 양식이 맞지 않습니다."
         })
 
-    # 기존 경고/정리 로직 유지 (require_full=False일 때만 의미)
+    # 기존 경고/정리 로직 (require_full=False일 때만 의미)
     nan_cnt = int(df[pred_col].isna().sum())
     if nan_cnt > 0 and not require_full:
         warn.append(f"nan_pred={nan_cnt} (dropped)")
         df = df.dropna(subset=[pred_col])
 
     merged = gt_df.merge(df[[ID_COL, pred_col]], on=ID_COL, how="inner")
-    # 전체 매칭 강제가 아니면서 겹침이 전혀 없을 때도 형식 오류로 통일
     if merged.empty:
         raise HTTPException(status_code=400, detail={
             "code": "BAD_SUBMISSION_FORMAT",
@@ -423,13 +346,11 @@ def _validate_and_score(
     try:
         score = float(roc_auc_score(y_true, y_pred))
     except Exception:
-        # 점수 계산 실패도 형식 오류로 통일
         raise HTTPException(status_code=400, detail={
             "code": "BAD_SUBMISSION_FORMAT",
             "message": "제출 양식이 맞지 않습니다."
         })
 
-    # require_full=False일 때만 참고용 경고 남김
     if not require_full:
         missing = len(gt_ids - sub_ids)
         extra   = len(sub_ids - gt_ids)
@@ -437,8 +358,35 @@ def _validate_and_score(
         if extra:   warn.append(f"extra_ids={extra} (ignored)")
 
     return score, int(len(merged)), "; ".join(warn) if warn else ""
+
+def _score_file_on_gt(csv_path: str, gt_df: pd.DataFrame) -> Tuple[Optional[float], int, str]:
+    """
+    관리자/최종 리더보드에서 원본 CSV를 GT_ALL에 대해 재채점.
+    - 전체 매칭 + 명시된 예측 컬럼만 허용(require_named_pred=True)
+    - 성공 시 (score, rows, warn) 반환
+    - 실패 시 (None, 0, '...')로 폴백
+    """
+    try:
+        sub_df = pd.read_csv(csv_path)
+    except Exception as e:
+        logger.warning("rescore read error: %s", e)
+        return None, 0, f"read_error:{e}"
+
+    try:
+        sc, rows, w = _validate_and_score(
+            sub_df, gt_df,
+            require_full=True,
+            require_named_pred=True
+        )
+        return sc, rows, w
+    except HTTPException:
+        return None, 0, "format_error"
+    except Exception as e:
+        logger.warning("rescore error: %s", e)
+        return None, 0, f"error:{e}"
+
 def _today_window_utc():
-    # ✅ UTC 기준 now → KST 변환 → KST 자정 ~ +1일 → 다시 UTC로
+    # ✅ UTC now → KST → 자정~+1일 → 다시 UTC
     now_kst = datetime.now(timezone.utc).astimezone(KST)
     start_kst = datetime.combine(now_kst.date(), dtime(0, 0, 0), tzinfo=KST)
     end_kst = start_kst + timedelta(days=1)
@@ -458,7 +406,19 @@ def _best_of_two(submissions: List[Submission], sort_field: str) -> Optional[Sub
     cands.sort(key=lambda r: (-getattr(r, sort_field), r.received_at))
     return cands[0]
 
-# ================== 스키마 ==================
+def _submit_count_map() -> dict:
+    with Session(engine) as s:
+        rows = s.exec(
+            select(Submission.team, func.count(Submission.id)).group_by(Submission.team)
+        ).all()
+    return {team: int(cnt) for team, cnt in rows}
+
+def _csv_response(name: str, df: pd.DataFrame) -> StreamingResponse:
+    buf = io.StringIO(); df.to_csv(buf, index=False); buf.seek(0)
+    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
+                             headers={"Content-Disposition": f'attachment; filename="{name}.csv"'})
+
+# -------------------- Schemas --------------------
 class LeaderboardItem(BaseModel):
     team: str
     public_score: Optional[float] = None
@@ -480,8 +440,8 @@ class RegisterBody(BaseModel):
     email: str
     team: str
     password: str
-    name: str          # ✅ 추가
-    student_id: str    # ✅ 추가 (8자리 숫자)
+    name: str
+    student_id: str  # 8자리 숫자
 
 class LoginBody(BaseModel):
     email: str
@@ -490,6 +450,7 @@ class LoginBody(BaseModel):
 class SettingsBody(BaseModel):
     final_private_visibility: Optional[str] = None  # "admin" | "public"
 
+# -------------------- Admin Settings --------------------
 @app.get("/admin/settings")
 def admin_get_settings(_: User = Depends(admin_required)):
     return {
@@ -504,7 +465,7 @@ def admin_set_settings(body: SettingsBody, _: User = Depends(admin_required)):
         set_setting("final_private_visibility", body.final_private_visibility)
     return {"ok": True}
 
-# ================== 인증 엔드포인트 ==================
+# -------------------- Auth --------------------
 @app.post("/auth/register")
 def register(body: RegisterBody):
     body.email = body.email.strip().lower()
@@ -515,7 +476,7 @@ def register(body: RegisterBody):
     if not body.email or not body.team or not body.password or not body.name or not body.student_id:
         raise HTTPException(status_code=400, detail={"code":"REQUIRED_FIELDS","message":"아이디/팀/비밀번호/이름/학번은 필수입니다."})
 
-    # 학번 형식 검증: 숫자 8자리
+    # 학번: 숫자 8자리
     if not (body.student_id.isdigit() and len(body.student_id) == 8):
         raise HTTPException(status_code=422, detail={"code":"INVALID_STUDENT_ID","message":"학번은 숫자 8자리여야 합니다."})
 
@@ -543,10 +504,10 @@ def login(body: LoginBody):
     user = get_user_by_email(email)
     if not user or not verify_password(body.password, user.password_hash):
         raise HTTPException(
-    status_code=401,
-    detail={"code": "INVALID_CREDENTIALS", "message": "아이디 또는 비밀번호가 올바르지 않습니다."},
-    headers={"WWW-Authenticate": "Bearer"}  # 토큰 기반이면 권장
-)
+            status_code=401,
+            detail={"code": "INVALID_CREDENTIALS", "message": "아이디 또는 비밀번호가 올바르지 않습니다."},
+            headers={"WWW-Authenticate": "Bearer"}
+        )
     token = create_access_token({"sub": user.email, "team": user.team, "is_admin": bool(user.is_admin)})
     return {"access_token": token, "token_type": "bearer", "team": user.team, "is_admin": bool(user.is_admin)}
 
@@ -556,7 +517,7 @@ def me(request: Request):
     return {"email": user.email, "team": user.team, "is_admin": user.is_admin,
             "name": user.name, "student_id": user.student_id}
 
-# ================== 제출/조회/최종 ==================
+# -------------------- Submit / My score / Finalize --------------------
 @app.post("/submit", response_model=SubmitResponse)
 async def submit(request: Request, file: UploadFile = File(...)):
     try:
@@ -583,7 +544,6 @@ async def submit(request: Request, file: UploadFile = File(...)):
                     "team": team,
                     "reset_at_local": f"00:00 {TZ_NAME}",
                 },
-                # headers={"Retry-After": ...}
             )
 
         try:
@@ -599,15 +559,15 @@ async def submit(request: Request, file: UploadFile = File(...)):
         warnings = []
         public_score = rows_pub = None
         private_score = rows_pri = None
-        
+
         if GT_PUBLIC is not None:
-            ps, rp, w = _validate_and_score(sub_df, GT_PUBLIC, require_full=True, require_named_pred=True)   # ✅ 전체 매칭 강제
+            ps, rp, w = _validate_and_score(sub_df, GT_PUBLIC, require_full=True, require_named_pred=True)
             public_score, rows_pub = ps, rp
             if w:
                 warnings.append(f"[public] {w}")
-        
+
         if GT_PRIVATE is not None:
-            ps, rp, w = _validate_and_score(sub_df, GT_PRIVATE, require_full=True, require_named_pred=True)  # ✅ 전체 매칭 강제
+            ps, rp, w = _validate_and_score(sub_df, GT_PRIVATE, require_full=True, require_named_pred=True)
             private_score, rows_pri = ps, rp
             if w:
                 warnings.append(f"[private] {w}")
@@ -628,7 +588,7 @@ async def submit(request: Request, file: UploadFile = File(...)):
             s.commit()
             s.refresh(rec)
 
-        # 원본 CSV 파일 보관 (최종 전체 테스트 재채점용)
+        # 원본 CSV 파일 보관
         try:
             safe_team = "".join([c if c.isalnum() or c in "-_." else "_" for c in team])
             fname = f"{rec.id}_{safe_team}.csv"
@@ -695,9 +655,6 @@ def my_score(request: Request):
         "history": [_row(s) for s in history],
     }
 
-class FinalizeBody(BaseModel):
-    submission_ids: List[int]
-
 @app.post("/finalize")
 def finalize(request: Request, body: FinalizeBody):
     user = _require_user(request)
@@ -716,7 +673,7 @@ def finalize(request: Request, body: FinalizeBody):
                 raise HTTPException(status_code=403, detail=f"Submission {sid} not owned by team {team}")
             subs.append(sub)
 
-        # ✅ 기존 선택 삭제 (SQLAlchemy 2.x 안전 방식)
+        # 기존 선택 삭제
         s.exec(delete(FinalPick).where(FinalPick.team == team))
         s.commit()
 
@@ -757,7 +714,52 @@ def my_quota(request: Request):
         "reset_at_local": f"00:00 {TZ_NAME}",
     }
 
-# 관리자: 유저 목록 조회 (옵션: 팀 필터)
+# -------------------- Admin: users & submissions --------------------
+def _require_admin(request: Request):
+    u = _get_current_user(request)
+    if u and u.is_admin:
+        return u
+    key = request.headers.get("X-ADMIN-KEY", "")
+    if ADMIN_KEY and key == ADMIN_KEY:
+        return None
+    raise HTTPException(status_code=403, detail="admin only")
+
+class DeleteReport(BaseModel):
+    deleted_submissions: int = 0
+    removed_final_picks: int = 0
+    removed_files: int = 0
+    deleted_users: int = 0
+
+def _delete_submissions_by_ids(ids: List[int]) -> DeleteReport:
+    rep = DeleteReport()
+    if not ids:
+        return rep
+    with Session(engine) as s:
+        # FinalPick 정리
+        rep.removed_final_picks = s.exec(
+            select(func.count()).select_from(FinalPick).where(FinalPick.submission_id.in_(ids))
+        ).one()
+        s.exec(delete(FinalPick).where(FinalPick.submission_id.in_(ids)))
+
+        # 파일 삭제
+        sfiles = s.exec(select(SubFile).where(SubFile.submission_id.in_(ids))).all()
+        for sf in sfiles:
+            try:
+                if sf.path and os.path.exists(sf.path):
+                    os.remove(sf.path)
+                    rep.removed_files += 1
+            except Exception:
+                pass
+        s.exec(delete(SubFile).where(SubFile.submission_id.in_(ids)))
+
+        # 제출 삭제
+        rep.deleted_submissions = s.exec(
+            select(func.count()).select_from(Submission).where(Submission.id.in_(ids))
+        ).one()
+        s.exec(delete(Submission).where(Submission.id.in_(ids)))
+        s.commit()
+    return rep
+
 @app.get("/admin/users")
 def admin_list_users(request: Request, _: User = Depends(admin_required), team: Optional[str] = None, limit: int = 500):
     with Session(engine) as s:
@@ -769,16 +771,10 @@ def admin_list_users(request: Request, _: User = Depends(admin_required), team: 
     return [{"email": u.email, "team": u.team, "is_admin": bool(u.is_admin),
              "name": u.name, "student_id": u.student_id} for u in rows]
 
-# 최근 제출 목록(관리자)
 @app.get("/admin/submissions")
-def admin_list_submissions(
-    request: Request,
-    team: Optional[str] = None,
-    limit: int = 200,
-):
+def admin_list_submissions(request: Request, team: Optional[str] = None, limit: int = 200):
     _require_admin(request)
 
-    # 1) 최근 제출 불러오기
     with Session(engine) as s:
         q = select(Submission)
         if team:
@@ -786,7 +782,6 @@ def admin_list_submissions(
         q = q.order_by(Submission.received_at.desc()).limit(limit)
         rows = s.exec(q).all()
 
-        # 원본 CSV 파일 경로 (재채점용) 미리 맵 구성
         ids = [r.id for r in rows]
         sfiles = s.exec(select(SubFile).where(SubFile.submission_id.in_(ids))).all()
 
@@ -803,7 +798,6 @@ def admin_list_submissions(
             logger.warning("admin/submissions rescore failed id=%s: %s", getattr(sub, "id", None), e)
         return round(float(sub.private_score), 6) if sub.private_score is not None else None
 
-    # 2) 딱 필요한 5개 컬럼만, 타입/포맷 안전하게 반환
     out = []
     for r in rows:
         sf = file_map.get(r.id)
@@ -816,13 +810,11 @@ def admin_list_submissions(
         })
     return out
 
-# 개별 제출 삭제
 @app.delete("/admin/submission/{submission_id}", response_model=DeleteReport)
 def admin_delete_submission(submission_id: int, request: Request):
     _require_admin(request)
     return _delete_submissions_by_ids([submission_id])
 
-# 팀의 모든 제출 삭제
 @app.delete("/admin/team/{team}/submissions", response_model=DeleteReport)
 def admin_delete_team_submissions(team: str, request: Request):
     _require_admin(request)
@@ -830,7 +822,6 @@ def admin_delete_team_submissions(team: str, request: Request):
         ids = [r[0] for r in s.exec(select(Submission.id).where(Submission.team == team)).all()]
     return _delete_submissions_by_ids(ids)
 
-# 사용자(계정) 삭제 (옵션: 같은 팀 제출도 함께 삭제)
 @app.delete("/admin/user/{email}", response_model=DeleteReport)
 def admin_delete_user(email: str, request: Request, cascade_team_submissions: bool = False):
     _require_admin(request)
@@ -851,14 +842,15 @@ def admin_delete_user(email: str, request: Request, cascade_team_submissions: bo
         rep.removed_files += team_rep.removed_files
     return rep
 
-# ---- 일반 리더보드 (팀별 최고 1개) ----
+# -------------------- Leaderboards --------------------
 def _best_per_team(sort_key: str):
     with Session(engine) as s:
         rows = s.exec(select(Submission)).all()
     best = {}
     for r in rows:
         score = getattr(r, sort_key)
-        if score is None: continue
+        if score is None:
+            continue
         if (r.team not in best) or (score > getattr(best[r.team], sort_key)) or \
            (score == getattr(best[r.team], sort_key) and r.received_at < best[r.team].received_at):
             best[r.team] = r
@@ -867,11 +859,11 @@ def _best_per_team(sort_key: str):
 @app.get("/leaderboard/public")
 def leaderboard_public(limit: int = 100):
     items = _best_per_team("public_score")[:limit]
-    cnt_map = _submit_count_map()  # ✅
+    cnt_map = _submit_count_map()
     return [{
         "team": r.team,
         "public_score": round(float(r.public_score), 6) if r.public_score is not None else None,
-        "submit_count": cnt_map.get(r.team, 0),                          # ✅
+        "submit_count": cnt_map.get(r.team, 0),
         "received_at": ts_kst(r.received_at),
         "warning": r.warning
     } for r in items]
@@ -885,13 +877,8 @@ def leaderboard_private(request: Request, limit: int = 100):
     return [{"team": r.team,
              "private_score": round(float(r.private_score), 6) if r.private_score is not None else None,
              "rows_private": r.rows_private,
-             "received_at": ts_kst(r.received_at),  # ✅
+             "received_at": ts_kst(r.received_at),
              "warning": r.warning} for r in items]
-
-def _csv_response(name: str, df: pd.DataFrame) -> StreamingResponse:
-    buf = io.StringIO(); df.to_csv(buf, index=False); buf.seek(0)
-    return StreamingResponse(iter([buf.getvalue()]), media_type="text/csv",
-                             headers={"Content-Disposition": f'attachment; filename="{name}.csv"'})
 
 @app.get("/leaderboard/public_csv")
 def leaderboard_public_csv(limit: int = 100):
@@ -902,7 +889,7 @@ def leaderboard_public_csv(limit: int = 100):
     df = pd.DataFrame([{
         "team": r.team,
         "public_score": round(float(r.public_score), 6) if r.public_score is not None else None,
-        "submit_count": cnt_map.get(r.team, 0),                          # ✅
+        "submit_count": cnt_map.get(r.team, 0),
         "received_at": ts_kst(r.received_at)
     } for r in items])
     return _csv_response("leaderboard_public", df)
@@ -944,12 +931,12 @@ def _final_best_map(sort_field: str):
 def final_leaderboard_public(limit: int = 100):
     best_map = _final_best_map("public_score")
     items = sorted(best_map.values(), key=lambda r: (-r.public_score, r.received_at))[:limit]
-    cnt_map = _submit_count_map()  # ✅
+    cnt_map = _submit_count_map()
     return [{
         "team": r.team,
         "submission_id": r.id,
         "public_score": round(float(r.public_score), 6) if r.public_score is not None else None,
-        "submit_count": cnt_map.get(r.team, 0),                           # ✅
+        "submit_count": cnt_map.get(r.team, 0),
         "received_at": ts_kst(r.received_at)
     } for r in items]
 
@@ -972,7 +959,7 @@ def final_leaderboard_private(request: Request, limit: int = 100):
 
     subs  = {r.id: r for r in subs_list}
     files = {r.submission_id: r for r in files_list}
-    cnt_map = _submit_count_map()  # ✅ 팀별 총 제출수
+    cnt_map = _submit_count_map()  # 팀별 총 제출수
 
     def _rescore_like_final(sub: Submission, sf: Optional[SubFile]):
         try:
@@ -1002,7 +989,7 @@ def final_leaderboard_private(request: Request, limit: int = 100):
                 "submission_id": sid,
                 "public_score": round(float(sub.public_score), 6) if sub.public_score is not None else None,
                 "private_score": round(float(score), 6),
-                "submit_count": cnt_map.get(team, 0),                       # ✅ 여기!
+                "submit_count": cnt_map.get(team, 0),
                 "received_at": ts_kst(sub.received_at) if sub and sub.received_at else None,
                 "_recv_key": recv_key,
             }
@@ -1028,7 +1015,7 @@ def final_leaderboard_public_csv(limit: int = 100):
         "team": r.team,
         "submission_id": r.id,
         "public_score": round(float(r.public_score), 6) if r.public_score is not None else None,
-        "submit_count": cnt_map.get(r.team, 0),                           # ✅
+        "submit_count": cnt_map.get(r.team, 0),
         "received_at": ts_kst(r.received_at)
     } for r in items])
     return _csv_response("final_leaderboard_public", df)
@@ -1045,6 +1032,7 @@ def final_leaderboard_private_csv(request: Request, limit: int = 100):
     df = pd.DataFrame(data)
     return _csv_response("final_leaderboard_private", df)
 
+# -------------------- Health --------------------
 @app.get("/health")
 def health():
     now_utc = datetime.now(timezone.utc).replace(microsecond=0)
