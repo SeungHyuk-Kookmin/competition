@@ -119,14 +119,33 @@ class User(SQLModel, table=True):
     team: str
     password_hash: str
     is_admin: bool = False
+
+    # ✅ 신규 필드
+    name: Optional[str] = None
+    student_id: Optional[str] = Field(default=None, index=True)
+
     __table_args__ = (
         UniqueConstraint("email", name="uix_user_email"),
-        # UniqueConstraint("team", name="uix_user_team"),  # <-- 제거
+        # UniqueConstraint("team", name="uix_user_team"),  # 그대로 비활성
     )
 
 # SQLite 멀티스레드 허용
 engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
 SQLModel.metadata.create_all(engine)
+
+def _ensure_user_columns():
+    # SQLite 전용 간단 마이그레이션
+    try:
+        with engine.connect() as conn:
+            cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info('user')").fetchall()}
+            if "name" not in cols:
+                conn.exec_driver_sql("ALTER TABLE user ADD COLUMN name VARCHAR;")
+            if "student_id" not in cols:
+                conn.exec_driver_sql("ALTER TABLE user ADD COLUMN student_id VARCHAR;")
+    except Exception as e:
+        logger.warning(f"User 테이블 마이그레이션 경고: {e}")
+
+_ensure_user_columns()
 
 # --------- Ground Truth 로드 ---------
 GT_PUBLIC = None
@@ -360,6 +379,9 @@ class LeaderboardItem(BaseModel):
 
 class SubmitResponse(LeaderboardItem):
     submission_id: int
+    used_today: Optional[int] = None
+    remaining_today: Optional[int] = None
+    daily_limit: Optional[int] = None
 
 class FinalizeBody(BaseModel):
     submission_ids: List[int]  # 1~2개
@@ -368,6 +390,8 @@ class RegisterBody(BaseModel):
     email: str
     team: str
     password: str
+    name: str          # ✅ 추가
+    student_id: str    # ✅ 추가 (8자리 숫자)
 
 class LoginBody(BaseModel):
     email: str
@@ -378,14 +402,31 @@ class LoginBody(BaseModel):
 def register(body: RegisterBody):
     body.email = body.email.strip().lower()
     body.team = body.team.strip()
-    if not body.email or not body.team or not body.password:
-        raise HTTPException(status_code=400, detail="email/team/password required")
+    body.name = body.name.strip()
+    body.student_id = body.student_id.strip()
+
+    if not body.email or not body.team or not body.password or not body.name or not body.student_id:
+        raise HTTPException(status_code=400, detail={"code":"REQUIRED_FIELDS","message":"아이디/팀/비밀번호/이름/학번은 필수입니다."})
+
+    # 학번 형식 검증: 숫자 8자리
+    if not (body.student_id.isdigit() and len(body.student_id) == 8):
+        raise HTTPException(status_code=422, detail={"code":"INVALID_STUDENT_ID","message":"학번은 숫자 8자리여야 합니다."})
+
     with Session(engine) as s:
         if s.exec(select(User).where(User.email == body.email)).first():
-            raise HTTPException(status_code=409, detail="email exists")
-        # if s.exec(select(User).where(User.team == body.team)).first():  # ❌ 삭제
-        #     raise HTTPException(status_code=409, detail="team exists")
-        user = User(email=body.email, team=body.team, password_hash=hash_password(body.password), is_admin=False)
+            raise HTTPException(status_code=409, detail={"code":"EMAIL_EXISTS","message":"이미 등록된 아이디입니다."})
+        # 선택: 학번 중복 방지
+        if s.exec(select(User).where(User.student_id == body.student_id)).first():
+            raise HTTPException(status_code=409, detail={"code":"STUDENT_ID_EXISTS","message":"이미 등록된 학번입니다."})
+
+        user = User(
+            email=body.email,
+            team=body.team,
+            password_hash=hash_password(body.password),
+            is_admin=False,
+            name=body.name,
+            student_id=body.student_id
+        )
         s.add(user); s.commit()
     return {"ok": True}
 
@@ -405,7 +446,8 @@ def login(body: LoginBody):
 @app.get("/auth/me")
 def me(request: Request):
     user = _require_user(request)
-    return {"email": user.email, "team": user.team, "is_admin": user.is_admin}
+    return {"email": user.email, "team": user.team, "is_admin": user.is_admin,
+            "name": user.name, "student_id": user.student_id}
 
 # ================== 제출/조회/최종 ==================
 @app.post("/submit", response_model=SubmitResponse)
@@ -434,8 +476,7 @@ async def submit(request: Request, file: UploadFile = File(...)):
                     "team": team,
                     "reset_at_local": f"00:00 {TZ_NAME}",
                 },
-                # 필요하면 재시도 힌트도 제공
-                # headers={"Retry-After": str(retry_after_seconds)}
+                # headers={"Retry-After": ...}
             )
 
         # CSV 읽기
@@ -490,6 +531,8 @@ async def submit(request: Request, file: UploadFile = File(...)):
 
         # 응답 (비공개 가시성 정책 반영)
         can_private = _has_private_access(request, user)
+        used_today = cnt + 1
+        remaining_today = max(0, DAILY_LIMIT - used_today)
         return SubmitResponse(
             submission_id=rec.id,
             team=team,
@@ -498,6 +541,9 @@ async def submit(request: Request, file: UploadFile = File(...)):
             rows_public=rows_pub,
             rows_private=rows_pri if can_private else None,
             received_at=ts_kst(rec.received_at),
+            used_today=used_today,
+            remaining_today=remaining_today,
+            daily_limit=DAILY_LIMIT,
         )
 
     except HTTPException:
@@ -578,6 +624,27 @@ def finalize(request: Request, body: FinalizeBody):
                                             "score": best_pri.private_score if best_pri else None}
         }
 
+@app.get("/my_quota")
+def my_quota(request: Request):
+    user = _require_user(request)
+    start_utc, end_utc = _today_window_utc()
+    with Session(engine) as s:
+        used = s.exec(
+            select(func.count()).select_from(Submission)
+            .where(Submission.team == user.team)
+            .where(Submission.received_at >= start_utc)
+            .where(Submission.received_at < end_utc)
+        ).one()
+    used = int(used)
+    remaining = max(0, DAILY_LIMIT - used)
+    return {
+        "team": user.team,
+        "used_today": used,
+        "remaining": remaining,
+        "daily_limit": DAILY_LIMIT,
+        "reset_at_local": f"00:00 {TZ_NAME}",
+    }
+
 # 관리자: 유저 목록 조회 (옵션: 팀 필터)
 @app.get("/admin/users")
 def admin_list_users(request: Request, _: User = Depends(admin_required), team: Optional[str] = None, limit: int = 500):
@@ -587,7 +654,8 @@ def admin_list_users(request: Request, _: User = Depends(admin_required), team: 
             q = q.where(User.team == team)
         q = q.order_by(User.id.desc()).limit(limit)
         rows = s.exec(q).all()
-    return [{"email": u.email, "team": u.team, "is_admin": bool(u.is_admin)} for u in rows]
+    return [{"email": u.email, "team": u.team, "is_admin": bool(u.is_admin),
+             "name": u.name, "student_id": u.student_id} for u in rows]
 
 # 최근 제출 목록(관리자)
 @app.get("/admin/submissions")
