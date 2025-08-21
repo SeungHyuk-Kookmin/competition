@@ -293,32 +293,70 @@ def _pick_pred_column(df: pd.DataFrame) -> str:
     numeric_cols.sort(key=lambda c: float(pd.to_numeric(df[c], errors="coerce").notna().mean()), reverse=True)
     return numeric_cols[0]
 
-def _validate_and_score(sub_df: pd.DataFrame, gt_df: pd.DataFrame) -> Tuple[float, int, str]:
+def _validate_and_score(
+    sub_df: pd.DataFrame,
+    gt_df: pd.DataFrame,
+    *,
+    require_full: bool = False,
+) -> Tuple[float, int, str]:
     warn = []
     df = sub_df.copy()
 
+    # ID 컬럼 정리
     if ID_COL not in df.columns:
         for g in ["id","Id","ID"]:
             if g in df.columns:
                 df = df.rename(columns={g: ID_COL}); break
         if ID_COL not in df.columns:
-            raise HTTPException(status_code=400, detail=f"Submission must include '{ID_COL}' column.")
+            # 형식 오류 통일
+            raise HTTPException(status_code=400, detail={
+                "code": "BAD_SUBMISSION_FORMAT",
+                "message": "제출 양식이 맞지 않습니다."
+            })
 
     df[ID_COL] = df[ID_COL].astype(str)
     pred_col = _pick_pred_column(df)
 
+    # 중복 ID는 즉시 에러
     if df[ID_COL].duplicated().any():
-        raise HTTPException(status_code=400, detail="Duplicate IDs in submission.")
+        raise HTTPException(status_code=400, detail={
+            "code": "BAD_SUBMISSION_FORMAT",
+            "message": "제출 양식이 맞지 않습니다."
+        })
 
+    # 숫자 변환
     df[pred_col] = pd.to_numeric(df[pred_col], errors="coerce")
+
+    # ✅ 전체 매칭 강제: GT에 있는 모든 ID가 제출에 존재해야 함
+    gt_ids = set(gt_df[ID_COL].astype(str))
+    sub_ids = set(df[ID_COL].astype(str))
+    missing_ids = gt_ids - sub_ids
+
+    # ✅ 전체 매칭 강제: 제출된 해당 ID들의 예측값이 NaN이면 안 됨
+    # (즉, GT와 겹치는 ID들 한정으로 NaN 검사)
+    df_in_gt = df[df[ID_COL].isin(gt_ids)]
+    nan_bad = set(df_in_gt.loc[df_in_gt[pred_col].isna(), ID_COL].astype(str))
+
+    if require_full and (missing_ids or nan_bad):
+        # 통일된 한국어 메시지
+        raise HTTPException(status_code=400, detail={
+            "code": "BAD_SUBMISSION_FORMAT",
+            "message": "제출 양식이 맞지 않습니다."
+        })
+
+    # 기존 경고/정리 로직 유지 (require_full=False일 때만 의미)
     nan_cnt = int(df[pred_col].isna().sum())
-    if nan_cnt > 0:
+    if nan_cnt > 0 and not require_full:
         warn.append(f"nan_pred={nan_cnt} (dropped)")
         df = df.dropna(subset=[pred_col])
 
     merged = gt_df.merge(df[[ID_COL, pred_col]], on=ID_COL, how="inner")
+    # 전체 매칭 강제가 아니면서 겹침이 전혀 없을 때도 형식 오류로 통일
     if merged.empty:
-        raise HTTPException(status_code=400, detail="No overlapping IDs with ground truth.")
+        raise HTTPException(status_code=400, detail={
+            "code": "BAD_SUBMISSION_FORMAT",
+            "message": "제출 양식이 맞지 않습니다."
+        })
 
     y_true = merged[Y_COL].values
     y_pred = merged[pred_col].values.astype(float)
@@ -328,25 +366,21 @@ def _validate_and_score(sub_df: pd.DataFrame, gt_df: pd.DataFrame) -> Tuple[floa
 
     try:
         score = float(roc_auc_score(y_true, y_pred))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"ROC_AUC failed: {e}")
+    except Exception:
+        # 점수 계산 실패도 형식 오류로 통일
+        raise HTTPException(status_code=400, detail={
+            "code": "BAD_SUBMISSION_FORMAT",
+            "message": "제출 양식이 맞지 않습니다."
+        })
 
-    missing = len(set(gt_df[ID_COL]) - set(df[ID_COL]))
-    extra   = len(set(df[ID_COL]) - set(gt_df[ID_COL]))
-    if missing: warn.append(f"missing_ids={missing}")
-    if extra:   warn.append(f"extra_ids={extra} (ignored)")
+    # require_full=False일 때만 참고용 경고 남김
+    if not require_full:
+        missing = len(gt_ids - sub_ids)
+        extra   = len(sub_ids - gt_ids)
+        if missing: warn.append(f"missing_ids={missing}")
+        if extra:   warn.append(f"extra_ids={extra} (ignored)")
 
     return score, int(len(merged)), "; ".join(warn) if warn else ""
-
-def _score_file_on_gt(path: str, gt_df: pd.DataFrame):
-    """저장된 제출 CSV를 열어 주어진 GT로 다시 채점."""
-    try:
-        df = pd.read_csv(path)
-        return _validate_and_score(df, gt_df)  # (score, rows, warn)
-    except Exception as e:
-        logger.warning("Rescore failed for %s: %s", path, e)
-        return None, None, f"rescore_failed:{e}"
-
 def _today_window_utc():
     # ✅ UTC 기준 now → KST 변환 → KST 자정 ~ +1일 → 다시 UTC로
     now_kst = datetime.now(timezone.utc).astimezone(KST)
@@ -487,15 +521,15 @@ async def submit(request: Request, file: UploadFile = File(...)):
         warnings = []
         public_score = rows_pub = None
         private_score = rows_pri = None
-
+        
         if GT_PUBLIC is not None:
-            ps, rp, w = _validate_and_score(sub_df, GT_PUBLIC)
+            ps, rp, w = _validate_and_score(sub_df, GT_PUBLIC, require_full=True)   # ✅ 전체 매칭 강제
             public_score, rows_pub = ps, rp
             if w:
                 warnings.append(f"[public] {w}")
-
+        
         if GT_PRIVATE is not None:
-            ps, rp, w = _validate_and_score(sub_df, GT_PRIVATE)
+            ps, rp, w = _validate_and_score(sub_df, GT_PRIVATE, require_full=True)  # ✅ 전체 매칭 강제
             private_score, rows_pri = ps, rp
             if w:
                 warnings.append(f"[private] {w}")
