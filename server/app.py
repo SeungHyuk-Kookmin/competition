@@ -526,10 +526,6 @@ async def submit(request: Request, file: UploadFile = File(...)):
                 # headers={"Retry-After": ...}
             )
 
-        # CSV 읽기
-        content = await file.read()
-        sub_df = pd.read_csv(io.BytesIO(content))
-
         try:
             content = await file.read()
             sub_df = pd.read_csv(io.BytesIO(content))
