@@ -283,6 +283,14 @@ def _has_private_access(request: Request, user: Optional[User]) -> bool:
 
     return False
 
+def _submit_count_map() -> dict:
+    with Session(engine) as s:
+        rows = s.exec(
+            select(Submission.team, func.count(Submission.id))
+            .group_by(Submission.team)
+        ).all()
+    return {team: int(cnt) for team, cnt in rows}
+
 # ================== 채점 유틸 ==================
 def _pick_pred_column(df: pd.DataFrame, *, strict: bool = False) -> str:
     # 허용 이름 우선
@@ -807,11 +815,14 @@ def _best_per_team(sort_key: str):
 @app.get("/leaderboard/public")
 def leaderboard_public(limit: int = 100):
     items = _best_per_team("public_score")[:limit]
-    return [{"team": r.team,
-             "public_score": round(float(r.public_score), 6) if r.public_score is not None else None,
-             "rows_public": r.rows_public,
-             "received_at": ts_kst(r.received_at),  # ✅
-             "warning": r.warning} for r in items]
+    cnt_map = _submit_count_map()  # ✅
+    return [{
+        "team": r.team,
+        "public_score": round(float(r.public_score), 6) if r.public_score is not None else None,
+        "submit_count": cnt_map.get(r.team, 0),                          # ✅
+        "received_at": ts_kst(r.received_at),
+        "warning": r.warning
+    } for r in items]
 
 @app.get("/leaderboard/private")
 def leaderboard_private(request: Request, limit: int = 100):
@@ -834,11 +845,14 @@ def _csv_response(name: str, df: pd.DataFrame) -> StreamingResponse:
 def leaderboard_public_csv(limit: int = 100):
     items = _best_per_team("public_score")[:limit]
     if not items:
-        return _csv_response("leaderboard_public", pd.DataFrame(columns=["team","public_score","rows_public","received_at"]))
-    df = pd.DataFrame([{"team": r.team,
-                        "public_score": round(float(r.public_score), 6) if r.public_score is not None else None,
-                        "rows_public": r.rows_public,
-                        "received_at": ts_kst(r.received_at)} for r in items])
+        return _csv_response("leaderboard_public", pd.DataFrame(columns=["team","public_score","submit_count","received_at"]))
+    cnt_map = _submit_count_map()
+    df = pd.DataFrame([{
+        "team": r.team,
+        "public_score": round(float(r.public_score), 6) if r.public_score is not None else None,
+        "submit_count": cnt_map.get(r.team, 0),                          # ✅
+        "received_at": ts_kst(r.received_at)
+    } for r in items])
     return _csv_response("leaderboard_public", df)
 
 @app.get("/leaderboard/private_csv")
@@ -878,11 +892,12 @@ def _final_best_map(sort_field: str):
 def final_leaderboard_public(limit: int = 100):
     best_map = _final_best_map("public_score")
     items = sorted(best_map.values(), key=lambda r: (-r.public_score, r.received_at))[:limit]
+    cnt_map = _submit_count_map()  # ✅
     return [{
         "team": r.team,
         "submission_id": r.id,
         "public_score": round(float(r.public_score), 6) if r.public_score is not None else None,
-        "rows_public": r.rows_public,                     # ✅ 추가
+        "submit_count": cnt_map.get(r.team, 0),                           # ✅
         "received_at": ts_kst(r.received_at)
     } for r in items]
 
@@ -892,11 +907,9 @@ def final_leaderboard_private(request: Request, limit: int = 100):
     if not _has_private_access(request, user):
         raise HTTPException(status_code=403, detail="Forbidden.")
 
-    # 1) 선택된 후보 수집
     with Session(engine) as s:
         picks = s.exec(select(FinalPick)).all()
-        if not picks:
-            return []
+        if not picks: return []
         team_to_ids = {}
         for p in picks:
             team_to_ids.setdefault(p.team, set()).add(p.submission_id)
@@ -907,33 +920,28 @@ def final_leaderboard_private(request: Request, limit: int = 100):
 
     subs  = {r.id: r for r in subs_list}
     files = {r.submission_id: r for r in files_list}
+    cnt_map = _submit_count_map()  # ✅ 팀별 총 제출수
 
     def _rescore_like_final(sub: Submission, sf: Optional[SubFile]):
-        """GT_ALL 재채점 성공 시 그 점수 사용, 실패 시 기존 private_score/rows_private 폴백."""
         try:
             if GT_ALL is not None and sf and sf.path and os.path.exists(sf.path):
                 sc, rows, _w = _score_file_on_gt(sf.path, GT_ALL)
                 if sc is not None:
-                    return float(sc), rows
+                    return float(sc)
         except Exception as e:
             logger.warning("final/private rescore failed (id=%s): %s", getattr(sub, "id", None), e)
-        if sub and sub.private_score is not None:
-            return float(sub.private_score), (sub.rows_private if sub.rows_private is not None else None)
-        return None, None
+        return float(sub.private_score) if sub and sub.private_score is not None else None
 
     items = []
     for team, idset in team_to_ids.items():
-        best = None  # dict로 보관
+        best = None
         for sid in idset:
             sub = subs.get(sid)
-            if not sub:
-                continue
+            if not sub: continue
             sf  = files.get(sid)
-            score, rows_used = _rescore_like_final(sub, sf)
-            if score is None:
-                continue
+            score = _rescore_like_final(sub, sf)
+            if score is None: continue
 
-            # 정렬/타이브레이크용 키 (UTC epoch; 안전하게 숫자)
             recv_dt = sub.received_at or datetime.now(timezone.utc)
             recv_key = recv_dt.timestamp()
 
@@ -942,25 +950,19 @@ def final_leaderboard_private(request: Request, limit: int = 100):
                 "submission_id": sid,
                 "public_score": round(float(sub.public_score), 6) if sub.public_score is not None else None,
                 "private_score": round(float(score), 6),
-                "rows": rows_used,
+                "submit_count": cnt_map.get(team, 0),                       # ✅ 여기!
                 "received_at": ts_kst(sub.received_at) if sub and sub.received_at else None,
-                "_recv_key": recv_key,  # 내부 정렬 전용
+                "_recv_key": recv_key,
             }
-
-            if (best is None) or \
-               (cand["private_score"] > best["private_score"]) or \
+            if (best is None) or (cand["private_score"] > best["private_score"]) or \
                (cand["private_score"] == best["private_score"] and cand["_recv_key"] < best["_recv_key"]):
                 best = cand
-
         if best:
             items.append(best)
 
-    # 안정 정렬: 점수 내림차순 → 제출시각 오름차순
     items.sort(key=lambda r: (-r["private_score"], r["_recv_key"]))
-    # 내부 키 제거
     for it in items:
         it.pop("_recv_key", None)
-
     return items[:limit]
 
 @app.get("/final/leaderboard_public_csv")
@@ -968,10 +970,15 @@ def final_leaderboard_public_csv(limit: int = 100):
     best_map = _final_best_map("public_score")
     items = sorted(best_map.values(), key=lambda r: (-r.public_score, r.received_at))[:limit]
     if not items:
-        return _csv_response("final_leaderboard_public", pd.DataFrame(columns=["team","submission_id","public_score","received_at"]))
-    df = pd.DataFrame([{"team": r.team, "submission_id": r.id,
-                        "public_score": round(float(r.public_score), 6) if r.public_score is not None else None,
-                        "received_at": ts_kst(r.received_at)} for r in items])
+        return _csv_response("final_leaderboard_public", pd.DataFrame(columns=["team","submission_id","public_score","submit_count","received_at"]))
+    cnt_map = _submit_count_map()
+    df = pd.DataFrame([{
+        "team": r.team,
+        "submission_id": r.id,
+        "public_score": round(float(r.public_score), 6) if r.public_score is not None else None,
+        "submit_count": cnt_map.get(r.team, 0),                           # ✅
+        "received_at": ts_kst(r.received_at)
+    } for r in items])
     return _csv_response("final_leaderboard_public", df)
 
 @app.get("/final/leaderboard_private_csv")
@@ -979,7 +986,7 @@ def final_leaderboard_private_csv(request: Request, limit: int = 100):
     data = final_leaderboard_private(request, limit=limit)
     if not data:
         return _csv_response("final_leaderboard_private",
-                             pd.DataFrame(columns=["team","submission_id","private_score","received_at"]))
+                             pd.DataFrame(columns=["team","submission_id","public_score","private_score","submit_count","received_at"]))
     df = pd.DataFrame(data)
     return _csv_response("final_leaderboard_private", df)
 
