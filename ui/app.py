@@ -119,7 +119,7 @@ with st.sidebar:
         st.write(f"역할: {'관리자' if st.session_state.is_admin else '참가자'}")
         q = fetch_quota()
         if q:
-            st.info(f"오늘 남은 제출: {q['remaining']}/{q['daily_limit']} (리셋: {q['reset_at_local']})")
+            st.info(f"오늘 남은 제출: {q['remaining']}/{q['daily_limit']}")
         if st.button("로그아웃"):
             st.session_state.token = None
             st.session_state.team = None
