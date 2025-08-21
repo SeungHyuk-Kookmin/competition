@@ -545,10 +545,11 @@ if IS_ADMIN:
                 if target.empty:
                     st.warning("선택된 계정이 없습니다.")
                 else:
-                    ok, skip, fail = 0, 0
+                    ok, skip, fail = 0, 0, 0
                     for _, row in target.iterrows():
                         email = str(row["email"]).strip().lower()
-                        is_admin_flag = bool(row["is_admin"])
+                        is_admin_flag = bool(row.get("is_admin", False))
+                        # 관리자 보호
                         if is_admin_flag and not allow_admin_del:
                             skip += 1
                             continue
