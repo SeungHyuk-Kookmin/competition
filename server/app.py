@@ -693,8 +693,14 @@ def admin_list_users(request: Request, _: User = Depends(admin_required), team: 
 
 # 최근 제출 목록(관리자)
 @app.get("/admin/submissions")
-def admin_list_submissions(request: Request, team: Optional[str] = None, limit: int = 200):
+def admin_list_submissions(
+    request: Request,
+    team: Optional[str] = None,
+    limit: int = 200,
+):
     _require_admin(request)
+
+    # 1) 최근 제출 불러오기
     with Session(engine) as s:
         q = select(Submission)
         if team:
@@ -702,43 +708,35 @@ def admin_list_submissions(request: Request, team: Optional[str] = None, limit: 
         q = q.order_by(Submission.received_at.desc()).limit(limit)
         rows = s.exec(q).all()
 
-        # 원본 CSV 경로 미리 모아두기
+        # 원본 CSV 파일 경로 (재채점용) 미리 맵 구성
         ids = [r.id for r in rows]
         sfiles = s.exec(select(SubFile).where(SubFile.submission_id.in_(ids))).all()
 
     file_map = {sf.submission_id: sf for sf in sfiles}
 
+    def _final_like_private_score(sub: Submission, sf: Optional[SubFile]):
+        """최종 리더보드(Private)와 동일: GT_ALL 재채점 성공 시 그 점수, 실패 시 기존 private_score 폴백."""
+        try:
+            if GT_ALL is not None and sf and sf.path and os.path.exists(sf.path):
+                sc, _rows, _w = _score_file_on_gt(sf.path, GT_ALL)
+                if sc is not None:
+                    return round(float(sc), 6)
+        except Exception as e:
+            logger.warning("admin/submissions rescore failed id=%s: %s", getattr(sub, "id", None), e)
+        return round(float(sub.private_score), 6) if sub.private_score is not None else None
+
+    # 2) 딱 필요한 5개 컬럼만, 타입/포맷 안전하게 반환
     out = []
     for r in rows:
-        # ✅ 최종 리더보드(Private)와 동일한 스코어 산출 로직:
-        # 1) GT_ALL로 재채점 성공 시 그 값을 사용
-        # 2) 실패하거나 파일 없으면 기존 저장된 private_score 폴백
-        final_like_private = None
         sf = file_map.get(r.id)
-        if GT_ALL is not None and sf and sf.path and os.path.exists(sf.path):
-            sc, _rows, _w = _score_file_on_gt(sf.path, GT_ALL)
-            if sc is not None:
-                final_like_private = float(sc)
-        if final_like_private is None and r.private_score is not None:
-            final_like_private = float(r.private_score)
-
-        item = {
-            "id": r.id,
+        out.append({
             "team": r.team,
+            "id": int(r.id),
+            "public_score": round(float(r.public_score), 6) if r.public_score is not None else None,
+            "private_score": _final_like_private_score(r, sf),
             "received_at": ts_kst(r.received_at),
-            "public_score": r.public_score,
-            # ⬇️ 여기의 private_score가 이제 ‘최종 리더보드(Private)’와 동일 로직
-            "private_score": round(final_like_private, 6) if final_like_private is not None else None,
-            # 참고용으로 원래 저장치도 함께 내려줌(원치 않으면 이 줄 삭제)
-            # "private_score_raw": round(float(r.private_score), 6) if r.private_score is not None else None,
-            "rows_public": r.rows_public,
-            "rows_private": r.rows_private,
-            "warning": r.warning,
-        }
-        out.append(item)
-
+        })
     return out
-
 
 # 개별 제출 삭제
 @app.delete("/admin/submission/{submission_id}", response_model=DeleteReport)
