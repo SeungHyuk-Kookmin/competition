@@ -319,26 +319,26 @@ if show_private_tab:
                        ["team","private_score","rows_private","received_at"], headers=headers)
     tab_idx += 1
 
-# --- 최종 리더보드 (관리자 전용) ---
-with tab_objs[tab_idx]:
-    st.subheader("최종 리더보드 (Public, best-of-two)")
-    show_board(
-        "/final/leaderboard_public", "/final/leaderboard_public_csv",
-        ["team", "public_score", "submit_count", "received_at"],
-        headers=authed_headers(),
-        labels={"public_score": "점수", "date": "등록일"}
-    )
-tab_idx += 1
-
-with tab_objs[tab_idx]:
-    st.subheader("최종 리더보드 (Private, best-of-two)")
-    show_board(
-        "/final/leaderboard_private", "/final/leaderboard_private_csv",
-        ["team", "public_score", "private_score", "submit_count", "received_at"],
-        headers=authed_headers(),
-        labels={"public_score": "Public", "private_score": "Private", "date": "등록일"}
-    )
-tab_idx += 1
+    # --- 최종 리더보드 (관리자 전용) ---
+    with tab_objs[tab_idx]:
+        st.subheader("최종 리더보드 (Public, best-of-two)")
+        show_board(
+            "/final/leaderboard_public", "/final/leaderboard_public_csv",
+            ["team", "public_score", "submit_count", "received_at"],
+            headers=authed_headers(),
+            labels={"public_score": "점수", "date": "등록일"}
+        )
+    tab_idx += 1
+    
+    with tab_objs[tab_idx]:
+        st.subheader("최종 리더보드 (Private, best-of-two)")
+        show_board(
+            "/final/leaderboard_private", "/final/leaderboard_private_csv",
+            ["team", "public_score", "private_score", "submit_count", "received_at"],
+            headers=authed_headers(),
+            labels={"public_score": "Public", "private_score": "Private", "date": "등록일"}
+        )
+    tab_idx += 1
 
 # --- 관리자 도구 ---
 if st.session_state.is_admin:
