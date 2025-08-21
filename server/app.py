@@ -29,8 +29,6 @@ class Setting(SQLModel, table=True):
     key: str = Field(primary_key=True)
     value: str
 
-SQLModel.metadata.create_all(engine)
-
 # --- defaults ---
 FINAL_PRIVATE_VISIBILITY_DEFAULT = os.getenv("FINAL_PRIVATE_VISIBILITY", "admin")  # admin|public
 
@@ -373,7 +371,7 @@ def _validate_and_score(
             })
 
     df[ID_COL] = df[ID_COL].astype(str)
-    pred_col = _pick_pred_column(df)
+    pred_col = _pick_pred_column(df, strict=require_named_pred)
 
     # 중복 ID는 즉시 에러
     if df[ID_COL].duplicated().any():
