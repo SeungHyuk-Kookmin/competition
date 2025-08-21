@@ -147,9 +147,7 @@ def show_board(endpoint_json, endpoint_csv, cols_order, headers=None, date_only=
                         "submission_id": "ID",
                         "public_score": "Public Score",
                         "private_score": "Private Score",
-                        "rows_public": "제출수",
-                        "rows_private": "제출수",
-                        "rows": "제출수",
+                        "submit_count": "제출수",
                         "date": "등록일",   # ✅ 기본값을 '등록일'로
                     }
                     if labels:
@@ -303,12 +301,8 @@ with tab_objs[tab_idx]:
     st.subheader("리더보드 (Public)")
     show_board(
         "/leaderboard/public", "/leaderboard/public_csv",
-        ["team", "public_score", "rows_public", "received_at"],
-        labels={
-            "public_score": "점수",
-            "rows_public": "제출수",
-            "date": "등록일",
-        }
+        ["team", "public_score", "submit_count", "received_at"],
+        labels={"public_score": "점수", "date": "등록일"}
     )
 tab_idx += 1
 
@@ -326,35 +320,25 @@ if show_private_tab:
     tab_idx += 1
 
 # --- 최종 리더보드 (관리자 전용) ---
-if show_final_tabs:
-    with tab_objs[tab_idx]:
-        st.subheader("최종 리더보드 (Public, best-of-two)")
-        show_board(
-            "/final/leaderboard_public", "/final/leaderboard_public_csv",
-            ["team", "public_score", "rows_public", "received_at"],
-            headers=authed_headers(),
-            labels={
-                "public_score": "점수",
-                "rows_public": "제출수",
-                "date": "등록일",
-            }
-        )
-    tab_idx += 1
+with tab_objs[tab_idx]:
+    st.subheader("최종 리더보드 (Public, best-of-two)")
+    show_board(
+        "/final/leaderboard_public", "/final/leaderboard_public_csv",
+        ["team", "public_score", "submit_count", "received_at"],
+        headers=authed_headers(),
+        labels={"public_score": "점수", "date": "등록일"}
+    )
+tab_idx += 1
 
-    with tab_objs[tab_idx]:
-        st.subheader("최종 리더보드 (Private, best-of-two)")
-        show_board(
-            "/final/leaderboard_private", "/final/leaderboard_private_csv",
-            ["team", "public_score", "private_score", "rows", "received_at"],
-            headers=authed_headers(),
-            labels={
-                "public_score": "Public",
-                "private_score": "Private",
-                "rows": "제출수",
-                "date": "등록일",
-            }
-        )
-    tab_idx += 1
+with tab_objs[tab_idx]:
+    st.subheader("최종 리더보드 (Private, best-of-two)")
+    show_board(
+        "/final/leaderboard_private", "/final/leaderboard_private_csv",
+        ["team", "public_score", "private_score", "submit_count", "received_at"],
+        headers=authed_headers(),
+        labels={"public_score": "Public", "private_score": "Private", "date": "등록일"}
+    )
+tab_idx += 1
 
 # --- 관리자 도구 ---
 if st.session_state.is_admin:
