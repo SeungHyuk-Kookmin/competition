@@ -24,6 +24,43 @@ PRIVATE_RELEASE_AT = os.getenv("PRIVATE_RELEASE_AT", "2025-08-29-14-00-00").stri
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
+# --- models ---
+class Setting(SQLModel, table=True):
+    key: str = Field(primary_key=True)
+    value: str
+
+SQLModel.metadata.create_all(engine)
+
+# --- defaults ---
+FINAL_PRIVATE_VISIBILITY_DEFAULT = os.getenv("FINAL_PRIVATE_VISIBILITY", "admin")  # admin|public
+
+# --- helpers ---
+def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
+    with Session(engine) as s:
+        row = s.get(Setting, key)
+        return row.value if row else default
+
+def set_setting(key: str, value: str):
+    with Session(engine) as s:
+        row = s.get(Setting, key)
+        if row:
+            row.value = value
+        else:
+            row = Setting(key=key, value=value)
+            s.add(row)
+        s.commit()
+
+def _has_final_private_access(request: Request, user: Optional[User]) -> bool:
+    # 1) 관리자 / X-ADMIN-KEY는 항상 허용
+    if user and getattr(user, "is_admin", False):
+        return True
+    key = request.headers.get("X-ADMIN-KEY", "")
+    if ADMIN_KEY and key == ADMIN_KEY:
+        return True
+    # 2) 설정 확인
+    vis = get_setting("final_private_visibility", FINAL_PRIVATE_VISIBILITY_DEFAULT)
+    return vis == "public"
+
 # ✅ 고정 KST (DST 없음)
 KST = timezone(timedelta(hours=9))
 TZ_NAME = "Asia/Seoul"  # 표기용
@@ -451,6 +488,23 @@ class RegisterBody(BaseModel):
 class LoginBody(BaseModel):
     email: str
     password: str
+
+class SettingsBody(BaseModel):
+    final_private_visibility: Optional[str] = None  # "admin" | "public"
+
+@app.get("/admin/settings")
+def admin_get_settings(_: User = Depends(admin_required)):
+    return {
+        "final_private_visibility": get_setting("final_private_visibility", FINAL_PRIVATE_VISIBILITY_DEFAULT)
+    }
+
+@app.post("/admin/settings")
+def admin_set_settings(body: SettingsBody, _: User = Depends(admin_required)):
+    if body.final_private_visibility:
+        if body.final_private_visibility not in ("admin", "public"):
+            raise HTTPException(status_code=400, detail="invalid visibility")
+        set_setting("final_private_visibility", body.final_private_visibility)
+    return {"ok": True}
 
 # ================== 인증 엔드포인트 ==================
 @app.post("/auth/register")
@@ -904,7 +958,7 @@ def final_leaderboard_public(limit: int = 100):
 @app.get("/final/leaderboard_private")
 def final_leaderboard_private(request: Request, limit: int = 100):
     user = _get_current_user(request)
-    if not _has_private_access(request, user):
+    if not _has_final_private_access(request, user):
         raise HTTPException(status_code=403, detail="Forbidden.")
 
     with Session(engine) as s:
@@ -983,6 +1037,9 @@ def final_leaderboard_public_csv(limit: int = 100):
 
 @app.get("/final/leaderboard_private_csv")
 def final_leaderboard_private_csv(request: Request, limit: int = 100):
+    user = _get_current_user(request)
+    if not _has_final_private_access(request, user):
+        raise HTTPException(status_code=403, detail="Forbidden.")
     data = final_leaderboard_private(request, limit=limit)
     if not data:
         return _csv_response("final_leaderboard_private",
@@ -1006,4 +1063,5 @@ def health():
         "now_kst": ts_kst(now_utc),
         "private_release_at_kst": RELEASE_AT_KST.strftime("%Y-%m-%d-%H-%M-%S") if RELEASE_AT_KST else None,
         "private_released": bool(RELEASE_AT_KST and now_kst >= RELEASE_AT_KST),
+        "final_private_visibility": get_setting("final_private_visibility", FINAL_PRIVATE_VISIBILITY_DEFAULT),
     }
