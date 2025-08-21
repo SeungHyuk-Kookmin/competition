@@ -284,20 +284,33 @@ def _has_private_access(request: Request, user: Optional[User]) -> bool:
     return False
 
 # ================== 채점 유틸 ==================
-def _pick_pred_column(df: pd.DataFrame) -> str:
+def _pick_pred_column(df: pd.DataFrame, *, strict: bool = False) -> str:
+    # 허용 이름 우선
     for c in PRED_CANDIDATES:
-        if c in df.columns: return c
+        if c in df.columns:
+            return c
+    # 엄격 모드면 허용 이름이 없을 때 바로 형식 오류
+    if strict:
+        raise HTTPException(status_code=400, detail={
+            "code": "BAD_SUBMISSION_FORMAT",
+            "message": "제출 양식이 맞지 않습니다."
+        })
+    # (비엄격 모드) 숫자 컬럼 자동 선택 - 관리자/내부 용도로만 사용
     numeric_cols = [c for c in df.columns if c != ID_COL and pd.api.types.is_numeric_dtype(df[c])]
     if not numeric_cols:
-        raise HTTPException(status_code=400, detail=f"No numeric prediction column found. Provide one of {PRED_CANDIDATES}")
+        raise HTTPException(status_code=400, detail={
+            "code": "BAD_SUBMISSION_FORMAT",
+            "message": "제출 양식이 맞지 않습니다."
+        })
     numeric_cols.sort(key=lambda c: float(pd.to_numeric(df[c], errors="coerce").notna().mean()), reverse=True)
     return numeric_cols[0]
-
+    
 def _validate_and_score(
     sub_df: pd.DataFrame,
     gt_df: pd.DataFrame,
     *,
     require_full: bool = False,
+    require_named_pred: bool = False,
 ) -> Tuple[float, int, str]:
     warn = []
     df = sub_df.copy()
@@ -517,19 +530,28 @@ async def submit(request: Request, file: UploadFile = File(...)):
         content = await file.read()
         sub_df = pd.read_csv(io.BytesIO(content))
 
+        try:
+            content = await file.read()
+            sub_df = pd.read_csv(io.BytesIO(content))
+        except Exception:
+            raise HTTPException(status_code=400, detail={
+                "code": "BAD_SUBMISSION_FORMAT",
+                "message": "제출 양식이 맞지 않습니다."
+            })
+
         # 채점
         warnings = []
         public_score = rows_pub = None
         private_score = rows_pri = None
         
         if GT_PUBLIC is not None:
-            ps, rp, w = _validate_and_score(sub_df, GT_PUBLIC, require_full=True)   # ✅ 전체 매칭 강제
+            ps, rp, w = _validate_and_score(sub_df, GT_PUBLIC, require_full=True, require_named_pred=True)   # ✅ 전체 매칭 강제
             public_score, rows_pub = ps, rp
             if w:
                 warnings.append(f"[public] {w}")
         
         if GT_PRIVATE is not None:
-            ps, rp, w = _validate_and_score(sub_df, GT_PRIVATE, require_full=True)  # ✅ 전체 매칭 강제
+            ps, rp, w = _validate_and_score(sub_df, GT_PRIVATE, require_full=True, require_named_pred=True)  # ✅ 전체 매칭 강제
             private_score, rows_pri = ps, rp
             if w:
                 warnings.append(f"[private] {w}")
