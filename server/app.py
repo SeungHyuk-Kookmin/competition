@@ -828,9 +828,13 @@ def _final_best_map(sort_field: str):
 def final_leaderboard_public(limit: int = 100):
     best_map = _final_best_map("public_score")
     items = sorted(best_map.values(), key=lambda r: (-r.public_score, r.received_at))[:limit]
-    return [{"team": r.team, "submission_id": r.id,
-             "public_score": round(float(r.public_score), 6) if r.public_score is not None else None,
-             "received_at": ts_kst(r.received_at)} for r in items]
+    return [{
+        "team": r.team,
+        "submission_id": r.id,
+        "public_score": round(float(r.public_score), 6) if r.public_score is not None else None,
+        "rows_public": r.rows_public,                     # ✅ 추가
+        "received_at": ts_kst(r.received_at)
+    } for r in items]
 
 @app.get("/final/leaderboard_private")
 def final_leaderboard_private(request: Request, limit: int = 100):
@@ -838,7 +842,6 @@ def final_leaderboard_private(request: Request, limit: int = 100):
     if not _has_private_access(request, user):
         raise HTTPException(status_code=403, detail="Forbidden.")
 
-    # picks 모으기
     with Session(engine) as s:
         picks = s.exec(select(FinalPick)).all()
         if not picks:
@@ -855,34 +858,34 @@ def final_leaderboard_private(request: Request, limit: int = 100):
     files = {r.submission_id: r for r in files_list}
 
     def _score_for_final(sid: int):
-        """GT_ALL 재채점 시도 → 실패 시 private_score 폴백."""
+        """GT_ALL 재채점 성공 시: (score, rows, 'all'), 실패 시 private_score 폴백: (score, rows_private, 'private')"""
         sub = subs.get(sid)
         sf = files.get(sid)
-        # 1) GT_ALL로 재채점
         if GT_ALL is not None and sf and sf.path and os.path.exists(sf.path):
-            sc, _rows, _w = _score_file_on_gt(sf.path, GT_ALL)
+            sc, rows, _w = _score_file_on_gt(sf.path, GT_ALL)
             if sc is not None:
-                return float(sc), sub
-        # 2) 기존 private_score 폴백
+                return float(sc), rows, "all", sub
         if sub and sub.private_score is not None:
-            return float(sub.private_score), sub
-        return None, sub
+            return float(sub.private_score), sub.rows_private, "private", sub
+        return None, None, None, sub
 
     items = []
     for team, idset in team_to_ids.items():
         best = None
         for sid in idset:
-            score, sub = _score_for_final(sid)
-            if score is None:
+            score, rows_used, mode, sub = _score_for_final(sid)
+            if score is None or sub is None:
                 continue
             cand = {
                 "team": team,
                 "submission_id": sid,
-                "private_score": round(float(score), 6),
+                "public_score": round(float(sub.public_score), 6) if sub.public_score is not None else None,  # ✅ 추가
+                "private_score": round(float(score), 6),                                                    # ✅ 기존
+                "rows": rows_used,                                                                          # ✅ 추가(최종 채점에 사용된 개수)
                 "received_at": ts_kst(sub.received_at) if sub and sub.received_at else None,
             }
             if (best is None) or (cand["private_score"] > best["private_score"]) or \
-               (cand["private_score"] == best["private_score"] and sub and best and subs.get(best["submission_id"]) and sub.received_at < subs[best["submission_id"]].received_at):
+               (cand["private_score"] == best["private_score"] and sub.received_at < subs[best["submission_id"]].received_at):
                 best = cand
         if best:
             items.append(best)
