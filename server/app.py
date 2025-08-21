@@ -876,6 +876,7 @@ def final_leaderboard_private(request: Request, limit: int = 100):
     if not _has_private_access(request, user):
         raise HTTPException(status_code=403, detail="Forbidden.")
 
+    # 1) 선택된 후보 수집
     with Session(engine) as s:
         picks = s.exec(select(FinalPick)).all()
         if not picks:
@@ -888,43 +889,62 @@ def final_leaderboard_private(request: Request, limit: int = 100):
         subs_list = s.exec(select(Submission).where(Submission.id.in_(list(ids)))).all()
         files_list = s.exec(select(SubFile).where(SubFile.submission_id.in_(list(ids)))).all()
 
-    subs = {r.id: r for r in subs_list}
+    subs  = {r.id: r for r in subs_list}
     files = {r.submission_id: r for r in files_list}
 
-    def _score_for_final(sid: int):
-        """GT_ALL 재채점 성공 시: (score, rows, 'all'), 실패 시 private_score 폴백: (score, rows_private, 'private')"""
-        sub = subs.get(sid)
-        sf = files.get(sid)
-        if GT_ALL is not None and sf and sf.path and os.path.exists(sf.path):
-            sc, rows, _w = _score_file_on_gt(sf.path, GT_ALL)
-            if sc is not None:
-                return float(sc), rows, "all", sub
+    def _rescore_like_final(sub: Submission, sf: Optional[SubFile]):
+        """GT_ALL 재채점 성공 시 그 점수 사용, 실패 시 기존 private_score/rows_private 폴백."""
+        try:
+            if GT_ALL is not None and sf and sf.path and os.path.exists(sf.path):
+                sc, rows, _w = _score_file_on_gt(sf.path, GT_ALL)
+                if sc is not None:
+                    return float(sc), rows
+        except Exception as e:
+            logger.warning("final/private rescore failed (id=%s): %s", getattr(sub, "id", None), e)
         if sub and sub.private_score is not None:
-            return float(sub.private_score), sub.rows_private, "private", sub
-        return None, None, None, sub
+            return float(sub.private_score), (sub.rows_private if sub.rows_private is not None else None)
+        return None, None
 
     items = []
     for team, idset in team_to_ids.items():
-        best = None
+        best = None  # dict로 보관
         for sid in idset:
-            score, rows_used, mode, sub = _score_for_final(sid)
-            if score is None or sub is None:
+            sub = subs.get(sid)
+            if not sub:
                 continue
+            sf  = files.get(sid)
+            score, rows_used = _rescore_like_final(sub, sf)
+            if score is None:
+                continue
+
+            # 정렬/타이브레이크용 키 (UTC epoch; 안전하게 숫자)
+            recv_dt = sub.received_at or datetime.now(timezone.utc)
+            recv_key = recv_dt.timestamp()
+
             cand = {
                 "team": team,
                 "submission_id": sid,
-                "public_score": round(float(sub.public_score), 6) if sub.public_score is not None else None,  # ✅ 추가
-                "private_score": round(float(score), 6),                                                    # ✅ 기존
-                "rows": rows_used,                                                                          # ✅ 추가(최종 채점에 사용된 개수)
+                "public_score": round(float(sub.public_score), 6) if sub.public_score is not None else None,
+                "private_score": round(float(score), 6),
+                "rows": rows_used,
                 "received_at": ts_kst(sub.received_at) if sub and sub.received_at else None,
+                "_recv_key": recv_key,  # 내부 정렬 전용
             }
-            if (best is None) or (cand["private_score"] > best["private_score"]) or \
-               (cand["private_score"] == best["private_score"] and sub.received_at < subs[best["submission_id"]].received_at):
+
+            if (best is None) or \
+               (cand["private_score"] > best["private_score"]) or \
+               (cand["private_score"] == best["private_score"] and cand["_recv_key"] < best["_recv_key"]):
                 best = cand
+
         if best:
             items.append(best)
 
-    items.sort(key=lambda r: (-r["private_score"], r["received_at"] or ""))
+    # 안정 정렬: 점수 내림차순 → 제출시각 오름차순
+    items.sort(key=lambda r: (-r["private_score"], r["_recv_key"]))
+    # 내부 키 제거
+    for it in items:
+        it.pop("_recv_key", None)
+
     return items[:limit]
 
 @app.get("/final/leaderboard_public_csv")
