@@ -315,31 +315,37 @@ if show_private_tab:
             st.info(f"비공개 리더보드는 아직 비공개 상태입니다. 공개 예정: {when} (KST)")
         else:
             headers = authed_headers() if private_visibility == "admin" else None
-            show_board("/leaderboard/private", "/leaderboard/private_csv",
-                       ["team","private_score","rows_private","received_at"], headers=headers)
+            show_board(
+                "/leaderboard/private", "/leaderboard/private_csv",
+                ["team","private_score","rows_private","received_at"],
+                headers=headers
+            )
     tab_idx += 1
 
-    # --- 최종 리더보드 (관리자 전용) ---
+# ✅ 최종 리더보드 렌더링은 반드시 show_private_tab 블록 '밖에서' 수행
+if show_final_tabs:
+    # --- 최종 리더보드 (Public, 관리자 전용) ---
     with tab_objs[tab_idx]:
         st.subheader("최종 리더보드 (Public, best-of-two)")
         show_board(
             "/final/leaderboard_public", "/final/leaderboard_public_csv",
             ["team", "public_score", "submit_count", "received_at"],
-            headers=authed_headers(),
+            headers=authed_headers(),  # 관리자 토큰 필요
             labels={"public_score": "점수", "date": "등록일"}
         )
     tab_idx += 1
-    
+
+    # --- 최종 리더보드 (Private, 관리자 전용 또는 정책에 따라) ---
     with tab_objs[tab_idx]:
         st.subheader("최종 리더보드 (Private, best-of-two)")
         show_board(
             "/final/leaderboard_private", "/final/leaderboard_private_csv",
             ["team", "public_score", "private_score", "submit_count", "received_at"],
-            headers=authed_headers(),
+            headers=authed_headers(),  # 관리자만 보게 할거면 헤더 필수
             labels={"public_score": "Public", "private_score": "Private", "date": "등록일"}
         )
     tab_idx += 1
-
+    
 # --- 관리자 도구 ---
 if st.session_state.is_admin:
     with tab_objs[-1]:
