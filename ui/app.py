@@ -129,7 +129,7 @@ with st.sidebar:
 
 
 # -------- Helpers --------
-def show_board(endpoint_json, endpoint_csv, cols_order, headers=None, date_only=True):
+def show_board(endpoint_json, endpoint_csv, cols_order, headers=None, date_only=True, labels=None):
     c1, c2 = st.columns([3, 1])
     with c1:
         try:
@@ -137,30 +137,31 @@ def show_board(endpoint_json, endpoint_csv, cols_order, headers=None, date_only=
             if r.status_code == 200:
                 df = pd.DataFrame(r.json())
                 if not df.empty:
-                    # 1) received_at → date(YYYY-MM-DD) 파생
                     if date_only and "received_at" in df.columns:
-                        df["date"] = df["received_at"].astype(str).str[:10]  # 날짜만
+                        df["date"] = df["received_at"].astype(str).str[:10]
 
-                    # 2) 표시 컬럼 구성: 호출부에서 "received_at"을 넘겨도 date로 치환
                     cols = [("date" if c == "received_at" else c) for c in cols_order]
-                    # 3) 보기 좋은 한글/표시명으로 rename
+
                     rename = {
                         "team": "팀",
                         "submission_id": "ID",
                         "public_score": "Public Score",
                         "private_score": "Private Score",
-                        "rows_public": "Rows",
-                        "rows_private": "Rows",
-                        "date": "제출일",
+                        "rows_public": "제출수",
+                        "rows_private": "제출수",
+                        "rows": "제출수",
+                        "date": "등록일",   # ✅ 기본값을 '등록일'로
                     }
-                    # 존재하는 컬럼만 표시
+                    if labels:
+                        rename.update(labels)
+
                     present = [c for c in cols if c in df.columns]
                     disp = df.rename(columns=rename)
                     disp_cols = [rename.get(c, c) for c in present]
 
                     st.dataframe(disp[disp_cols], use_container_width=True)
                 else:
-                    st.info("아직 제출이 없습니다.")
+                    st.info("데이터가 없습니다.")
             else:
                 st.error(f"{r.status_code} - {r.text}")
         except Exception as e:
@@ -300,8 +301,15 @@ tab_idx += 1
 # --- 리더보드(공개) ---
 with tab_objs[tab_idx]:
     st.subheader("리더보드 (Public)")
-    show_board("/leaderboard/public", "/leaderboard/public_csv",
-               ["team","public_score","rows_public","received_at"])
+    show_board(
+        "/leaderboard/public", "/leaderboard/public_csv",
+        ["team", "public_score", "rows_public", "received_at"],
+        labels={
+            "public_score": "점수",
+            "rows_public": "제출수",
+            "date": "등록일",
+        }
+    )
 tab_idx += 1
 
 # --- 리더보드(비공개) ---
@@ -321,14 +329,31 @@ if show_private_tab:
 if show_final_tabs:
     with tab_objs[tab_idx]:
         st.subheader("최종 리더보드 (Public, best-of-two)")
-        show_board("/final/leaderboard_public", "/final/leaderboard_public_csv",
-                   ["team","submission_id","public_score","received_at"], headers=authed_headers())
+        show_board(
+            "/final/leaderboard_public", "/final/leaderboard_public_csv",
+            ["team", "public_score", "rows_public", "received_at"],
+            headers=authed_headers(),
+            labels={
+                "public_score": "점수",
+                "rows_public": "제출수",
+                "date": "등록일",
+            }
+        )
     tab_idx += 1
 
     with tab_objs[tab_idx]:
         st.subheader("최종 리더보드 (Private, best-of-two)")
-        show_board("/final/leaderboard_private", "/final/leaderboard_private_csv",
-                   ["team","submission_id","private_score","received_at"], headers=authed_headers())
+        show_board(
+            "/final/leaderboard_private", "/final/leaderboard_private_csv",
+            ["team", "public_score", "private_score", "rows", "received_at"],
+            headers=authed_headers(),
+            labels={
+                "public_score": "Public",
+                "private_score": "Private",
+                "rows": "제출수",
+                "date": "등록일",
+            }
+        )
     tab_idx += 1
 
 # --- 관리자 도구 ---
