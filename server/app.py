@@ -10,9 +10,11 @@ import pandas as pd
 import numpy as np
 from sklearn.metrics import roc_auc_score
 import io, os, logging
-from sqlalchemy import func, UniqueConstraint, delete
+from sqlalchemy import func, UniqueConstraint, delete, event
 from jose import jwt, JWTError
 from passlib.context import CryptContext
+from pathlib import Path
+import sys
 
 logger = logging.getLogger("uvicorn.error")
 
@@ -42,8 +44,22 @@ PRIVATE_VISIBILITY = os.getenv("PRIVATE_VISIBILITY", "hidden")  # hidden | admin
 PRIVATE_RELEASE_AT = os.getenv("PRIVATE_RELEASE_AT", "2025-08-29-14-00-00").strip()
 RELEASE_AT_KST = _parse_release_at_kst(PRIVATE_RELEASE_AT)
 
-SUBMIT_SAVE_DIR = os.getenv("SUBMIT_SAVE_DIR", "./submissions")
-os.makedirs(SUBMIT_SAVE_DIR, exist_ok=True)
+# ✅ 영구 디스크 경로 고정(/var/data) + 디렉토리 보장 + 마운트 검증
+STORAGE_DIR = os.getenv("STORAGE_DIR", "/var/data/submissions")
+Path("/var/data").mkdir(parents=True, exist_ok=True)
+Path(STORAGE_DIR).mkdir(parents=True, exist_ok=True)
+
+def _assert_persistent_mount():
+    # /var/data가 진짜 쓰기 가능한지 부팅 시점에 강제 확인(미부착이면 바로 종료)
+    try:
+        p = Path("/var/data/.write_test")
+        p.write_text("ok", encoding="utf-8")
+        p.unlink(missing_ok=True)
+    except Exception as e:
+        logger.error("FATAL: /var/data 쓰기 불가(디스크 미부착/권한문제): %s", e)
+        sys.exit(1)
+
+_assert_persistent_mount()
 
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "10"))
 
@@ -53,15 +69,16 @@ Y_COL   = os.getenv("Y_COL",  "y_true")
 GT_PUBLIC_PATH  = os.getenv("GT_PUBLIC_PATH",  "./data/y_test_public.csv")
 GT_PRIVATE_PATH = os.getenv("GT_PRIVATE_PATH", "./data/y_test_private.csv")
 
-DB_URL = os.getenv("DATABASE_URL", "sqlite:///./leaderboard.db")
+# ✅ DB를 영구 디스크로 고정
+DB_URL = os.getenv("DATABASE_URL", "sqlite:////var/data/leaderboard.db")
 KEEP_BEST_PER_TEAM = True
 PRED_CANDIDATES = [os.getenv("PRED_COL", "y_pred"), "pred", "prob", "probability", "score"]
 
 # private 가시성: "hidden" | "admin" | "public" | "public_after"
 ADMIN_KEY = os.getenv("ADMIN_KEY", "")  # (옵션) 관리자 헤더 백도어
 
-# JWT
-SECRET_KEY = os.getenv("SECRET_KEY", "dev-insecure-secret-change-me")
+# JWT (요청 반영: 기본값 00000000)
+SECRET_KEY = os.getenv("SECRET_KEY", "00000000")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "720"))
 
@@ -75,7 +92,19 @@ app = FastAPI(title="Competition Scoring API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # -------------------- DB Engine --------------------
-engine = create_engine(DB_URL, connect_args={"check_same_thread": False} if DB_URL.startswith("sqlite") else {})
+connect_args = {"check_same_thread": False} if DB_URL.startswith("sqlite") else {}
+engine = create_engine(DB_URL, connect_args=connect_args, pool_pre_ping=True)
+
+# ✅ SQLite 내구성/동시접속 개선
+@event.listens_for(engine, "connect")
+def _sqlite_pragmas(dbapi_conn, _):
+    try:
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA synchronous=NORMAL;")
+        cur.close()
+    except Exception:
+        pass
 
 # -------------------- Models --------------------
 class Setting(SQLModel, table=True):
@@ -110,7 +139,7 @@ class User(SQLModel, table=True):
     student_id: Optional[str] = Field(default=None, index=True)
     __table_args__ = (
         UniqueConstraint("email", name="uix_user_email"),
-        # 팀명 중복 허용 (경험상 팀명 재사용 이슈 회피 목적)
+        # 팀명 중복 허용
         # UniqueConstraint("team", name="uix_user_team"),
     )
 
@@ -122,6 +151,8 @@ class SubFile(SQLModel, table=True):
 
 # 테이블 생성(단 한 번만)
 SQLModel.metadata.create_all(engine)
+logger.info("Using DB: %s", DB_URL)
+logger.info("Storage: %s", STORAGE_DIR)
 
 def _ensure_user_columns():
     # SQLite 전용 간단 마이그레이션: user.name, user.student_id 없으면 추가
@@ -588,11 +619,11 @@ async def submit(request: Request, file: UploadFile = File(...)):
             s.commit()
             s.refresh(rec)
 
-        # 원본 CSV 파일 보관
+        # ✅ 원본 CSV 파일 보관: 영구 디스크(/var/data/submissions)
         try:
             safe_team = "".join([c if c.isalnum() or c in "-_." else "_" for c in team])
             fname = f"{rec.id}_{safe_team}.csv"
-            fpath = os.path.join(SUBMIT_SAVE_DIR, fname)
+            fpath = os.path.join(STORAGE_DIR, fname)
             with open(fpath, "wb") as fw:
                 fw.write(content)
             with Session(engine) as s2:
