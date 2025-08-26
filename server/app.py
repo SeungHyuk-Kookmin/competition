@@ -182,12 +182,14 @@ def _bootstrap_admin():
     # ADMIN_EMAIL/ADMIN_PASSWORD가 비어있으면 아무 것도 안 함
     if not ADMIN_EMAIL or not ADMIN_PASSWORD:
         return
+    hashed = pwd_context.hash(ADMIN_PASSWORD)  # <-- 직접 해시
+
     with Session(engine) as s:
         u = s.exec(select(User).where(func.lower(User.email) == ADMIN_EMAIL)).first()
         if u:
             # 권한 보장 + 비밀번호 재설정
             u.is_admin = True
-            u.password_hash = hash_password(ADMIN_PASSWORD)
+            u.password_hash = hashed
             if not u.team:
                 u.team = ADMIN_TEAM
             s.commit()
@@ -196,7 +198,7 @@ def _bootstrap_admin():
             u = User(
                 email=ADMIN_EMAIL,
                 team=ADMIN_TEAM,
-                password_hash=hash_password(ADMIN_PASSWORD),
+                password_hash=hashed,
                 is_admin=True,
             )
             s.add(u)
