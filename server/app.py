@@ -82,6 +82,10 @@ SECRET_KEY = os.getenv("SECRET_KEY", "00000000")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "720"))
 
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").strip().lower()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
+ADMIN_TEAM = os.getenv("ADMIN_TEAM", "__admin__")
+
 # 최종 리더보드 private 공개 정책(설정 기본값)
 FINAL_PRIVATE_VISIBILITY_DEFAULT = os.getenv("FINAL_PRIVATE_VISIBILITY", "admin")  # admin|public
 
