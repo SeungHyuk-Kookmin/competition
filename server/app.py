@@ -1,3 +1,4 @@
+from fastapi.responses import StreamingResponse, JSONResponse, RedirectResponse
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -177,6 +178,33 @@ def _ensure_user_columns():
 
 _ensure_user_columns()
 
+def _bootstrap_admin():
+    # ADMIN_EMAIL/ADMIN_PASSWORD가 비어있으면 아무 것도 안 함
+    if not ADMIN_EMAIL or not ADMIN_PASSWORD:
+        return
+    with Session(engine) as s:
+        u = s.exec(select(User).where(func.lower(User.email) == ADMIN_EMAIL)).first()
+        if u:
+            # 권한 보장 + 비밀번호 재설정
+            u.is_admin = True
+            u.password_hash = hash_password(ADMIN_PASSWORD)
+            if not u.team:
+                u.team = ADMIN_TEAM
+            s.commit()
+            logger.info("Bootstrap admin updated: %s", ADMIN_EMAIL)
+        else:
+            u = User(
+                email=ADMIN_EMAIL,
+                team=ADMIN_TEAM,
+                password_hash=hash_password(ADMIN_PASSWORD),
+                is_admin=True,
+            )
+            s.add(u)
+            s.commit()
+            logger.info("Bootstrap admin created: %s", ADMIN_EMAIL)
+
+_bootstrap_admin()
+
 # -------------------- Settings helpers --------------------
 def get_setting(key: str, default: Optional[str] = None) -> Optional[str]:
     with Session(engine) as s:
@@ -229,7 +257,9 @@ def verify_password(pw: str, pw_hash: str) -> bool:
 
 def get_user_by_email(email: str) -> Optional[User]:
     with Session(engine) as s:
-        return s.exec(select(User).where(User.email == email)).first()
+        return s.exec(
+            select(User).where(func.lower(User.email) == email.strip().lower())
+        ).first()
 
 def create_access_token(data: dict, minutes: int = ACCESS_TOKEN_EXPIRE_MINUTES) -> str:
     to_encode = data.copy()
@@ -1086,6 +1116,25 @@ def final_leaderboard_private_csv(request: Request, limit: int = 100):
                              pd.DataFrame(columns=["team","submission_id","public_score","private_score","submit_count","received_at"]))
     df = pd.DataFrame(data)
     return _csv_response("final_leaderboard_private", df)
+
+# === 루트/레거시 경로 호환 ===
+@app.get("/")
+def root():
+    return JSONResponse({
+        "ok": True,
+        "message": "Competition API",
+        "try": ["/health", "/docs", "/leaderboard/public"]
+    })
+
+# 예전 프런트가 '/api/...'로 호출해도 동작하도록 307 리다이렉트
+@app.api_route("/api/{path:path}", methods=["GET","POST","PUT","PATCH","DELETE","OPTIONS","HEAD"])
+async def compat_api_prefix(path: str, request: Request):
+    qs = f"?{request.url.query}" if request.url.query else ""
+    return RedirectResponse(url=f"/{path}{qs}", status_code=307)
+
+@app.get("/api")
+def compat_api_root():
+    return RedirectResponse(url="/docs", status_code=307)
 
 # -------------------- Health --------------------
 @app.get("/health")
