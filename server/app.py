@@ -107,6 +107,11 @@ def _sqlite_pragmas(dbapi_conn, _):
         pass
 
 # -------------------- Models --------------------
+class EnsureAdminBody(BaseModel):
+    email: str
+    password: str
+    team: Optional[str] = "__admin__"
+
 class Setting(SQLModel, table=True):
     key: str = Field(primary_key=True)
     value: str
@@ -487,6 +492,21 @@ def admin_get_settings(_: User = Depends(admin_required)):
     return {
         "final_private_visibility": get_setting("final_private_visibility", FINAL_PRIVATE_VISIBILITY_DEFAULT)
     }
+
+@app.post("/admin/ensure_admin")
+def ensure_admin(body: EnsureAdminBody, _: User = Depends(admin_required)):
+    body.email = body.email.strip().lower()
+    with Session(engine) as s:
+        u = s.exec(select(User).where(func.lower(User.email) == body.email)).first()
+        if u:
+            u.password_hash = hash_password(body.password)
+            u.is_admin = True
+        else:
+            u = User(email=body.email, team=body.team or "__admin__",
+                     password_hash=hash_password(body.password), is_admin=True)
+            s.add(u)
+        s.commit()
+    return {"ok": True}
 
 @app.post("/admin/settings")
 def admin_set_settings(body: SettingsBody, _: User = Depends(admin_required)):
