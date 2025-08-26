@@ -23,7 +23,7 @@ private_released = info.get("private_released", False)
 
 st.set_page_config(page_title="ML STUDY Competition", layout="wide")
 st.title("📈 D&A X WEAVE 여름방학 ML STUDY Competition")
-st.caption("일일 제출 제한: 팀당 10회 (자정 기준)")
+st.caption(f"일일 제출 제한: 팀당 {info.get('daily_limit', 10)}회 (자정 기준)")
 
 def parse_err(resp):
     try:
