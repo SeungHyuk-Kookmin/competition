@@ -3,9 +3,8 @@ import requests
 import pandas as pd
 import streamlit as st
 from sqlalchemy import func, UniqueConstraint, delete
-from datetime import datetime
-import pytz
 from datetime import datetime, timezone, timedelta, time as dtime
+import pytz
 
 API = os.getenv("API_URL", "http://localhost:8000")
 
