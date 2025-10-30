@@ -412,9 +412,6 @@ def _validate_and_score(
     y_true = merged[Y_COL].values
     y_pred = merged[pred_col].values.astype(float)
 
-    if (y_pred.min() < 0) or (y_pred.max() > 1):
-        warn.append("pred_out_of_[0,1]")
-
     try:
         mse = np.mean((y_true - y_pred) ** 2)
         score = float(np.sqrt(mse))
@@ -939,7 +936,7 @@ def _best_per_team(sort_key: str):
         score = getattr(r, sort_key)
         if score is None:
             continue
-        if (r.team not in best) or (score > getattr(best[r.team], sort_key)) or \
+        if (r.team not in best) or (score < getattr(best[r.team], sort_key)) or \
            (score == getattr(best[r.team], sort_key) and r.received_at < best[r.team].received_at):
             best[r.team] = r
     return sorted(best.values(), key=lambda x: (getattr(x, sort_key), x.received_at))
@@ -1018,7 +1015,8 @@ def _final_best_map(sort_field: str):
 @app.get("/final/leaderboard_public")
 def final_leaderboard_public(limit: int = 100):
     best_map = _final_best_map("public_score")
-    items = sorted(best_map.values(), key=lambda r: (-r.public_score, r.received_at))[:limit]
+    # ✅ 낮은 RMSE가 상위
+    items = sorted(best_map.values(), key=lambda r: (r.public_score, r.received_at))[:limit]
     cnt_map = _submit_count_map()
     return [{
         "team": r.team,
@@ -1087,7 +1085,7 @@ def final_leaderboard_private(request: Request, limit: int = 100):
         if best:
             items.append(best)
 
-    items.sort(key=lambda r: (-r["private_score"], r["_recv_key"]))
+    items.sort(key=lambda r: (r["private_score"], r["_recv_key"]))
     for it in items:
         it.pop("_recv_key", None)
     return items[:limit]
