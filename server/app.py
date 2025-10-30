@@ -416,7 +416,8 @@ def _validate_and_score(
         warn.append("pred_out_of_[0,1]")
 
     try:
-        score = float(roc_auc_score(y_true, y_pred))
+        mse = np.mean((y_true - y_pred) ** 2)
+        score = float(np.sqrt(mse))
     except Exception:
         raise HTTPException(status_code=400, detail={
             "code": "BAD_SUBMISSION_FORMAT",
@@ -469,13 +470,13 @@ def _best_submission_for_team(team: str, sort_field: str) -> Optional[Submission
         rows = s.exec(select(Submission).where(Submission.team == team)).all()
     rows = [r for r in rows if getattr(r, sort_field) is not None]
     if not rows: return None
-    rows.sort(key=lambda r: (-getattr(r, sort_field), r.received_at))
+    rows.sort(key=lambda r: (getattr(r, sort_field), r.received_at))
     return rows[0]
 
 def _best_of_two(submissions: List[Submission], sort_field: str) -> Optional[Submission]:
     cands = [s for s in submissions if s is not None and getattr(s, sort_field) is not None]
     if not cands: return None
-    cands.sort(key=lambda r: (-getattr(r, sort_field), r.received_at))
+    cands.sort(key=lambda r: (getattr(r, sort_field), r.received_at))
     return cands[0]
 
 def _submit_count_map() -> dict:
@@ -941,7 +942,7 @@ def _best_per_team(sort_key: str):
         if (r.team not in best) or (score > getattr(best[r.team], sort_key)) or \
            (score == getattr(best[r.team], sort_key) and r.received_at < best[r.team].received_at):
             best[r.team] = r
-    return sorted(best.values(), key=lambda x: (-getattr(x, sort_key), x.received_at))
+    return sorted(best.values(), key=lambda x: (getattr(x, sort_key), x.received_at))
 
 @app.get("/leaderboard/public")
 def leaderboard_public(limit: int = 100):
@@ -1010,7 +1011,7 @@ def _final_best_map(sort_field: str):
     for team, idset in team_to_ids.items():
         cands = [sub for sub in subs if sub.id in idset and getattr(sub, sort_field) is not None]
         if not cands: continue
-        cands.sort(key=lambda r: (-getattr(r, sort_field), r.received_at))
+        cands.sort(key=lambda r: (getattr(r, sort_field), r.received_at))
         result[team] = cands[0]
     return result
 
