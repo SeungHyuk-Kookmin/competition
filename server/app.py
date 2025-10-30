@@ -1093,9 +1093,13 @@ def final_leaderboard_private(request: Request, limit: int = 100):
 @app.get("/final/leaderboard_public_csv")
 def final_leaderboard_public_csv(limit: int = 100):
     best_map = _final_best_map("public_score")
-    items = sorted(best_map.values(), key=lambda r: (-r.public_score, r.received_at))[:limit]
+    # ✅ 낮은 RMSE가 상위
+    items = sorted(best_map.values(), key=lambda r: (r.public_score, r.received_at))[:limit]
     if not items:
-        return _csv_response("final_leaderboard_public", pd.DataFrame(columns=["team","submission_id","public_score","submit_count","received_at"]))
+        return _csv_response(
+            "final_leaderboard_public",
+            pd.DataFrame(columns=["team","submission_id","public_score","submit_count","received_at"])
+        )
     cnt_map = _submit_count_map()
     df = pd.DataFrame([{
         "team": r.team,
