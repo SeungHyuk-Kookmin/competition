@@ -1034,7 +1034,8 @@ def final_leaderboard_private(request: Request, limit: int = 100):
 
     with Session(engine) as s:
         picks = s.exec(select(FinalPick)).all()
-        if not picks: return []
+        if not picks:
+            return []
         team_to_ids = {}
         for p in picks:
             team_to_ids.setdefault(p.team, set()).add(p.submission_id)
@@ -1062,10 +1063,12 @@ def final_leaderboard_private(request: Request, limit: int = 100):
         best = None
         for sid in idset:
             sub = subs.get(sid)
-            if not sub: continue
-            sf  = files.get(sid)
+            if not sub:
+                continue
+            sf = files.get(sid)
             score = _rescore_like_final(sub, sf)
-            if score is None: continue
+            if score is None:
+                continue
 
             recv_dt = sub.received_at or datetime.now(timezone.utc)
             recv_key = recv_dt.timestamp()
@@ -1079,12 +1082,16 @@ def final_leaderboard_private(request: Request, limit: int = 100):
                 "received_at": ts_kst(sub.received_at) if sub and sub.received_at else None,
                 "_recv_key": recv_key,
             }
-            if (best is None) or (cand["private_score"] > best["private_score"]) or \
+
+            # ✅ 수정된 부분: RMSE는 낮을수록 좋음 (<)
+            if (best is None) or (cand["private_score"] < best["private_score"]) or \
                (cand["private_score"] == best["private_score"] and cand["_recv_key"] < best["_recv_key"]):
                 best = cand
+
         if best:
             items.append(best)
 
+    # ✅ 정렬도 낮은 RMSE가 상위로
     items.sort(key=lambda r: (r["private_score"], r["_recv_key"]))
     for it in items:
         it.pop("_recv_key", None)
